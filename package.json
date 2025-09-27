@@ -1,0 +1,56 @@
+{
+  "name": "package-conflicts-resolver",
+  "version": "0.0.1",
+  "description": "A Node.js CLI tool that automatically resolves conflicts in package.json and package-lock.json files",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "resolve-conflicts": "dist/cli.js",
+    "package-conflicts-resolver": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --test dist/test/**/*.test.js",
+    "test:watch": "node --test --watch dist/test/**/*.test.js",
+    "lint": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build && npm test",
+    "publish:beta": "npm version prerelease --preid=beta -m \"beta version - %s\" && npm publish --tag beta",
+    "publish:patch": "npm version patch -m \"patch version - %s\" && npm publish",
+    "publish:minor": "npm version minor -m \"minor version - %s\" && npm publish",
+    "publish:major": "npm version major -m \"major version - %s\" && npm publish"
+  },
+  "keywords": [
+    "package.json",
+    "package-lock.json",
+    "git",
+    "merge",
+    "conflicts",
+    "cli",
+    "resolver",
+    "npm"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "commander": "^12.0.0",
+    "semver": "^7.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/semver": "^7.5.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.3.0"
+  }
+}
