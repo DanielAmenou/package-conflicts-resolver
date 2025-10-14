@@ -101,11 +101,25 @@ async function main() {
     .command("setup")
     .description("Setup Git integration (merge driver and hooks)")
     .option("--global", "Setup globally for all repositories", false)
+    .option("--skip-gitattributes", "Skip automatic .gitattributes setup", false)
     .action(async (options: any) => {
       try {
-        await setupGitIntegration(options.global)
+        await setupGitIntegration(options.global, options.skipGitattributes)
       } catch (error) {
         console.error(`❌ Failed to setup Git integration: ${error instanceof Error ? error.message : String(error)}`)
+        process.exit(1)
+      }
+    })
+
+  // Verify subcommand to check setup
+  program
+    .command("verify")
+    .description("Verify that Git integration is setup correctly")
+    .action(async () => {
+      try {
+        await verifySetup()
+      } catch (error) {
+        console.error(`❌ Verification failed: ${error instanceof Error ? error.message : String(error)}`)
         process.exit(1)
       }
     })
@@ -143,7 +157,11 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
           })
         )
       } else {
-        console.log(`ℹ️ No Git conflict markers found in ${filePath}`)
+        console.log(`✅ No Git conflict markers found in ${filePath}`)
+        console.log(`\nℹ️  If you expected automatic conflict resolution during Git merge:`)
+        console.log(`   1. Run: package-conflicts-resolver setup`)
+        console.log(`   2. Run: package-conflicts-resolver verify`)
+        console.log(`   3. Ensure conflicts happen in package.json or package-lock.json`)
       }
     }
     process.exit(0)
@@ -216,7 +234,7 @@ async function regeneratePackageLock(quiet: boolean): Promise<void> {
 /**
  * Setup Git integration
  */
-async function setupGitIntegration(global: boolean): Promise<void> {
+async function setupGitIntegration(global: boolean, skipGitattributes: boolean = false): Promise<void> {
   const scope = global ? "--global" : "--local"
 
   try {
@@ -239,13 +257,199 @@ async function setupGitIntegration(global: boolean): Promise<void> {
       gitProcess.on("error", reject)
     })
 
-    if (!global) {
-      console.log("ℹ To complete setup, add this to your .gitattributes file:")
-      console.log("package.json merge=package-conflicts-resolver")
-      console.log("package-lock.json merge=package-conflicts-resolver")
+    // Set merge driver name for better git messages
+    const nameProcess = spawn("git", [
+      "config",
+      scope,
+      "merge.package-conflicts-resolver.name",
+      "Automatic package.json conflict resolver",
+    ])
+
+    await new Promise<void>((resolve, reject) => {
+      nameProcess.on("close", code => {
+        if (code === 0) {
+          resolve()
+        } else {
+          // Don't fail if name setting fails
+          resolve()
+        }
+      })
+      nameProcess.on("error", () => resolve())
+    })
+
+    console.log(`✅ Git merge driver configured ${global ? "globally" : "locally"}`)
+
+    if (!global && !skipGitattributes) {
+      // Try to setup .gitattributes automatically
+      await setupGitattributes()
+    } else if (global) {
+      console.log(`\n⚠️  Global setup complete, but you still need to add .gitattributes to each repository:`)
+      console.log(`\nAdd this to your .gitattributes file in each project:`)
+      console.log(`  package.json merge=package-conflicts-resolver`)
+      console.log(`  package-lock.json merge=package-conflicts-resolver`)
+      console.log(`\nOr run 'package-conflicts-resolver setup' (without --global) in each repository.`)
     }
+
+    console.log(`\n✅ Setup complete! Run 'package-conflicts-resolver verify' to test the configuration.`)
   } catch (error) {
     throw new Error(`Failed to setup Git integration: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
+/**
+ * Setup or update .gitattributes file
+ */
+async function setupGitattributes(): Promise<void> {
+  try {
+    const gitattributesPath = ".gitattributes"
+    const requiredLines = [
+      "package.json merge=package-conflicts-resolver",
+      "package-lock.json merge=package-conflicts-resolver",
+    ]
+
+    let content = ""
+    let fileExists = false
+
+    // Try to read existing .gitattributes
+    try {
+      content = await readFile(gitattributesPath, "utf8")
+      fileExists = true
+    } catch {
+      // File doesn't exist, will create it
+    }
+
+    const lines = content.split("\n")
+    let modified = false
+
+    // Check and add missing lines
+    for (const requiredLine of requiredLines) {
+      const exists = lines.some(line => line.trim() === requiredLine)
+      if (!exists) {
+        lines.push(requiredLine)
+        modified = true
+      }
+    }
+
+    if (modified) {
+      const {writeFile} = await import("fs/promises")
+      await writeFile(gitattributesPath, lines.filter(l => l.trim()).join("\n") + "\n", "utf8")
+      console.log(`✅ ${fileExists ? "Updated" : "Created"} .gitattributes file`)
+    } else {
+      console.log(`✅ .gitattributes already configured correctly`)
+    }
+  } catch (error) {
+    console.warn(
+      `⚠️  Could not setup .gitattributes automatically: ${error instanceof Error ? error.message : String(error)}`
+    )
+    console.log(`\nPlease manually add these lines to your .gitattributes file:`)
+    console.log(`  package.json merge=package-conflicts-resolver`)
+    console.log(`  package-lock.json merge=package-conflicts-resolver`)
+  }
+}
+
+/**
+ * Verify Git integration setup
+ */
+async function verifySetup(): Promise<void> {
+  console.log("🔍 Verifying Git integration setup...\n")
+
+  let hasErrors = false
+
+  // Check git config
+  try {
+    const gitProcess = spawn("git", ["config", "merge.package-conflicts-resolver.driver"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+
+    const chunks: Buffer[] = []
+    gitProcess.stdout.on("data", chunk => chunks.push(chunk))
+
+    await new Promise<void>((resolve, reject) => {
+      gitProcess.on("close", code => {
+        if (code === 0) {
+          const driver = Buffer.concat(chunks).toString().trim()
+          if (driver.includes("package-conflicts-resolver merge-driver")) {
+            console.log("✅ Git merge driver is configured")
+            console.log(`   Driver: ${driver}`)
+          } else {
+            console.log("⚠️  Git merge driver is configured but may be incorrect:")
+            console.log(`   Driver: ${driver}`)
+            hasErrors = true
+          }
+          resolve()
+        } else {
+          console.log("❌ Git merge driver is NOT configured")
+          console.log("   Run: package-conflicts-resolver setup")
+          hasErrors = true
+          resolve()
+        }
+      })
+      gitProcess.on("error", () => {
+        console.log("❌ Failed to check git config")
+        hasErrors = true
+        resolve()
+      })
+    })
+  } catch (error) {
+    console.log("❌ Failed to check git config")
+    hasErrors = true
+  }
+
+  // Check .gitattributes
+  try {
+    const content = await readFile(".gitattributes", "utf8")
+    const lines = content.split("\n")
+
+    const hasPackageJson = lines.some(line => line.trim() === "package.json merge=package-conflicts-resolver")
+    const hasPackageLock = lines.some(line => line.trim() === "package-lock.json merge=package-conflicts-resolver")
+
+    if (hasPackageJson && hasPackageLock) {
+      console.log("✅ .gitattributes is configured correctly")
+    } else {
+      console.log("⚠️  .gitattributes is incomplete:")
+      if (!hasPackageJson) console.log("   Missing: package.json merge=package-conflicts-resolver")
+      if (!hasPackageLock) console.log("   Missing: package-lock.json merge=package-conflicts-resolver")
+      console.log("   Run: package-conflicts-resolver setup")
+      hasErrors = true
+    }
+  } catch {
+    console.log("⚠️  .gitattributes file not found")
+    console.log("   Run: package-conflicts-resolver setup")
+    hasErrors = true
+  }
+
+  // Check if package-conflicts-resolver is accessible
+  try {
+    const which = spawn("which", ["npx"], {stdio: ["pipe", "pipe", "pipe"]})
+    await new Promise<void>((resolve, reject) => {
+      which.on("close", code => {
+        if (code === 0) {
+          console.log("✅ npx is available")
+        } else {
+          console.log("⚠️  npx not found in PATH")
+          hasErrors = true
+        }
+        resolve()
+      })
+      which.on("error", () => {
+        console.log("⚠️  npx not found in PATH")
+        hasErrors = true
+        resolve()
+      })
+    })
+  } catch {
+    console.log("⚠️  Could not verify npx availability")
+  }
+
+  console.log()
+  if (hasErrors) {
+    console.log("❌ Setup verification failed. Please fix the issues above.")
+    console.log("\nTo fix, run: package-conflicts-resolver setup")
+    process.exit(1)
+  } else {
+    console.log("✅ All checks passed! Git integration is set up correctly.")
+    console.log("\nThe tool will now automatically resolve conflicts in package.json")
+    console.log("and package-lock.json during Git merges.")
   }
 }
 

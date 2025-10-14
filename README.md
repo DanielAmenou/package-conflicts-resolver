@@ -48,6 +48,16 @@ package-conflicts-resolver --strategy lowest
 - `ours` - Use our version (current branch)
 - `theirs` - Use their version (incoming branch)
 
+### Commands
+
+```bash
+# Main commands
+package-conflicts-resolver [file]           # Resolve conflicts in file (default: package.json)
+package-conflicts-resolver setup            # Setup Git integration for current repository
+package-conflicts-resolver setup --global   # Setup Git integration globally
+package-conflicts-resolver verify           # Verify Git integration is working
+```
+
 ### Options
 
 ```bash
@@ -57,27 +67,50 @@ package-conflicts-resolver --strategy lowest
 -j, --json                    Output in JSON format
 -v, --verbose                 Enable verbose logging
 --no-regenerate-lock          Skip package-lock.json regeneration
+--skip-gitattributes          Skip automatic .gitattributes setup (for setup command)
 ```
 
 ## Git Integration
 
-### As Git Merge Driver
+### Quick Setup (Recommended)
 
 Set up automatic conflict resolution during Git merges:
 
 ```bash
-# Setup for current repository
+# Setup for current repository (automatically creates/updates .gitattributes)
 package-conflicts-resolver setup
 
-# Setup globally for all repositories
-package-conflicts-resolver setup --global
+# Verify the setup is working
+package-conflicts-resolver verify
 ```
 
-Then add to your `.gitattributes`:
+That's it! The tool will now automatically resolve conflicts in `package.json` and `package-lock.json` during Git merges.
+
+### Global Setup
+
+For global setup across all repositories:
+
+```bash
+# Setup globally
+package-conflicts-resolver setup --global
+
+# Then run this in each repository to create .gitattributes
+package-conflicts-resolver setup
+```
+
+### Manual Setup
+
+If you prefer to set up manually, add these lines to your `.gitattributes`:
 
 ```
 package.json merge=package-conflicts-resolver
 package-lock.json merge=package-conflicts-resolver
+```
+
+And configure the merge driver:
+
+```bash
+git config merge.package-conflicts-resolver.driver "npx package-conflicts-resolver merge-driver %A %O %B"
 ```
 
 ### In Git Hooks
@@ -165,10 +198,84 @@ if (result.resolved && result.packageJson) {
 }
 ```
 
+## Troubleshooting
+
+### Conflicts are not being resolved automatically
+
+1. **Check if setup is complete**:
+
+   ```bash
+   package-conflicts-resolver verify
+   ```
+
+2. **Ensure conflicts are in package.json or package-lock.json**:
+   The tool only resolves conflicts in these files.
+
+3. **Check if .gitattributes exists**:
+
+   ```bash
+   cat .gitattributes
+   ```
+
+   Should contain:
+
+   ```
+   package.json merge=package-conflicts-resolver
+   package-lock.json merge=package-conflicts-resolver
+   ```
+
+4. **Re-run setup**:
+   ```bash
+   package-conflicts-resolver setup
+   ```
+
+### Manual resolution after merge
+
+If you encounter conflicts after a merge:
+
+```bash
+# Resolve conflicts in package.json
+package-conflicts-resolver package.json
+
+# Or just run in the directory with package.json
+package-conflicts-resolver
+```
+
+### Verify installation
+
+```bash
+# Check if the tool is installed
+which package-conflicts-resolver
+
+# Check version
+package-conflicts-resolver --version
+
+# Verify Git integration
+package-conflicts-resolver verify
+```
+
+### Common Issues
+
+**"No Git conflict markers found"**
+
+- This means your file doesn't have conflicts, or they've already been resolved.
+- Run `package-conflicts-resolver verify` to check your setup.
+
+**"Git merge driver is NOT configured"**
+
+- Run `package-conflicts-resolver setup` to configure the merge driver.
+
+**.gitattributes not working**
+
+- Make sure `.gitattributes` is committed to your repository.
+- Check that it's in the root directory of your repository.
+- Try running `git check-attr -a package.json` to verify Git sees the attributes.
+
 ## Requirements
 
 - Node.js 20+
 - npm (for package-lock.json regeneration)
+- Git 2.0+
 
 ## License
 
