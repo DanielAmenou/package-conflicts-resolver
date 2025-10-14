@@ -4,11 +4,10 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 
 ## Features
 
-- 🔄 **Automatic conflict resolution** with configurable strategies
-- 🎯 **Smart version resolution** using semver
-- 🔧 **Git integration** as merge driver or in hooks
-- 📝 **Comprehensive logging** with human-readable and JSON output
-- ✅ **Stable JSON formatting** - preserves field order and structure
+- **Automatic conflict resolution** with configurable strategies
+- **Smart version resolution** using semver
+- **Git integration** as merge driver or in hooks
+- **Stable JSON formatting** - preserves field order and structure
 
 ## Installation
 
