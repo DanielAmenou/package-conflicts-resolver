@@ -314,22 +314,27 @@ async function setupGitattributes(): Promise<void> {
       // File doesn't exist, will create it
     }
 
+    // Check if all required lines exist
     const lines = content.split("\n")
-    let modified = false
+    const missingLines = requiredLines.filter(requiredLine => !lines.some(line => line.trim() === requiredLine))
 
-    // Check and add missing lines
-    for (const requiredLine of requiredLines) {
-      const exists = lines.some(line => line.trim() === requiredLine)
-      if (!exists) {
-        lines.push(requiredLine)
-        modified = true
-      }
-    }
-
-    if (modified) {
+    if (missingLines.length > 0) {
       const {writeFile} = await import("fs/promises")
-      await writeFile(gitattributesPath, lines.filter(l => l.trim()).join("\n") + "\n", "utf8")
+
+      // Preserve original content and append missing lines
+      let newContent = content
+      if (newContent && !newContent.endsWith("\n")) {
+        newContent += "\n"
+      }
+
+      // Add missing lines
+      for (const missingLine of missingLines) {
+        newContent += missingLine + "\n"
+      }
+
+      await writeFile(gitattributesPath, newContent, "utf8")
       console.log(`✅ ${fileExists ? "Updated" : "Created"} .gitattributes file`)
+      console.log(`   Added: ${missingLines.join(", ")}`)
     } else {
       console.log(`✅ .gitattributes already configured correctly`)
     }
