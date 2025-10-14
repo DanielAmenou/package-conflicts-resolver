@@ -23,10 +23,10 @@
     "clean": "rm -rf dist",
     "uninstall": "node dist/cli.js uninstall",
     "prepublishOnly": "npm run clean && npm run build && npm test",
-    "publish:beta": "npm version prerelease --preid=beta -m \"beta version - %s\" && npm publish --tag beta",
-    "publish:patch": "npm version patch -m \"patch version - %s\" && npm publish",
-    "publish:minor": "npm version minor -m \"minor version - %s\" && npm publish",
-    "publish:major": "npm version major -m \"major version - %s\" && npm publish"
+    "publish:beta": "npm version prerelease --preid=beta -m \"beta version - %s\" && npm publish --tag beta && git push && git push --tags",
+    "publish:patch": "npm version patch -m \"patch version - %s\" && npm publish && git push && git push --tags",
+    "publish:minor": "npm version minor -m \"minor version - %s\" && npm publish && git push && git push --tags",
+    "publish:major": "npm version major -m \"major version - %s\" && npm publish && git push && git push --tags"
   },
   "keywords": [
     "package.json",
