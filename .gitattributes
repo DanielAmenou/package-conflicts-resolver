@@ -1,0 +1,2 @@
+package.json merge=package-conflicts-resolver
+package-lock.json merge=package-conflicts-resolver
