@@ -21,6 +21,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "clean": "rm -rf dist",
+    "uninstall": "node dist/cli.js uninstall",
     "prepublishOnly": "npm run clean && npm run build && npm test",
     "publish:beta": "npm version prerelease --preid=beta -m \"beta version - %s\" && npm publish --tag beta",
     "publish:patch": "npm version patch -m \"patch version - %s\" && npm publish",

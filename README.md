@@ -55,6 +55,8 @@ package-conflicts-resolver --strategy lowest
 package-conflicts-resolver [file]           # Resolve conflicts in file (default: package.json)
 package-conflicts-resolver setup            # Setup Git integration for current repository
 package-conflicts-resolver setup --global   # Setup Git integration globally
+package-conflicts-resolver uninstall        # Remove Git integration for current repository
+package-conflicts-resolver uninstall --global # Remove global Git integration
 package-conflicts-resolver verify           # Verify Git integration is working
 ```
 
@@ -112,6 +114,44 @@ And configure the merge driver:
 ```bash
 git config merge.package-conflicts-resolver.driver "npx package-conflicts-resolver merge-driver %A %O %B"
 ```
+
+### Removing Git Integration
+
+To remove the Git integration:
+
+```bash
+# Remove integration for current repository
+package-conflicts-resolver uninstall
+
+# Remove global integration
+package-conflicts-resolver uninstall --global
+
+# Force removal without confirmation
+package-conflicts-resolver uninstall --force
+```
+
+This will:
+
+- Remove the Git merge driver configuration
+- Remove package-conflicts-resolver entries from .gitattributes (for local uninstall)
+
+#### Manual Removal
+
+If you prefer to remove manually:
+
+1. **Remove Git configuration:**
+
+   ```bash
+   git config --unset merge.package-conflicts-resolver.driver
+   git config --unset merge.package-conflicts-resolver.name
+   ```
+
+2. **Remove from .gitattributes:**
+   Edit `.gitattributes` and remove these lines:
+   ```
+   package.json merge=package-conflicts-resolver
+   package-lock.json merge=package-conflicts-resolver
+   ```
 
 ### In Git Hooks
 
@@ -270,6 +310,12 @@ package-conflicts-resolver verify
 - Make sure `.gitattributes` is committed to your repository.
 - Check that it's in the root directory of your repository.
 - Try running `git check-attr -a package.json` to verify Git sees the attributes.
+
+**"Git integration is still active after uninstall"**
+
+- Run `package-conflicts-resolver verify` to check current status.
+- Try the manual removal steps if the uninstall command fails.
+- Check both local and global Git configurations: `git config --list | grep package-conflicts-resolver`
 
 ## Requirements
 

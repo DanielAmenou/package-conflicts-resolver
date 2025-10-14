@@ -120,6 +120,23 @@ async function main() {
       }
     })
 
+  // Uninstall subcommand to remove Git integration
+  program
+    .command("uninstall")
+    .description("Remove Git integration (merge driver and .gitattributes)")
+    .option("--global", "Remove global Git integration", false)
+    .option("--force", "Force removal without confirmation", false)
+    .action(async (options: any) => {
+      try {
+        await uninstallGitIntegration(options.global, options.force)
+      } catch (error) {
+        console.error(
+          `❌ Failed to uninstall Git integration: ${error instanceof Error ? error.message : String(error)}`
+        )
+        process.exit(1)
+      }
+    })
+
   await program.parseAsync()
 }
 
@@ -356,37 +373,67 @@ async function verifySetup(): Promise<void> {
 
   let hasErrors = false
 
-  // Check git config
+  // Check git config (both local and global)
   try {
-    const gitProcess = spawn("git", ["config", "merge.package-conflicts-resolver.driver"], {
+    // Check local config first
+    const localProcess = spawn("git", ["config", "--local", "merge.package-conflicts-resolver.driver"], {
       stdio: ["pipe", "pipe", "pipe"],
     })
 
-    const chunks: Buffer[] = []
-    gitProcess.stdout.on("data", chunk => chunks.push(chunk))
+    const localChunks: Buffer[] = []
+    localProcess.stdout.on("data", chunk => localChunks.push(chunk))
 
-    await new Promise<void>((resolve, reject) => {
-      gitProcess.on("close", code => {
+    await new Promise<void>(resolve => {
+      localProcess.on("close", code => {
         if (code === 0) {
-          const driver = Buffer.concat(chunks).toString().trim()
+          const driver = Buffer.concat(localChunks).toString().trim()
           if (driver.includes("package-conflicts-resolver merge-driver")) {
-            console.log("✅ Git merge driver is configured")
+            console.log("✅ Git merge driver is configured (local)")
             console.log(`   Driver: ${driver}`)
           } else {
-            console.log("⚠️  Git merge driver is configured but may be incorrect:")
+            console.log("⚠️  Git merge driver is configured (local) but may be incorrect:")
             console.log(`   Driver: ${driver}`)
             hasErrors = true
           }
           resolve()
         } else {
-          console.log("❌ Git merge driver is NOT configured")
-          console.log("   Run: package-conflicts-resolver setup")
-          hasErrors = true
-          resolve()
+          // Local config doesn't exist, check global config
+          const globalProcess = spawn("git", ["config", "--global", "merge.package-conflicts-resolver.driver"], {
+            stdio: ["pipe", "pipe", "pipe"],
+          })
+
+          const globalChunks: Buffer[] = []
+          globalProcess.stdout.on("data", chunk => globalChunks.push(chunk))
+
+          globalProcess.on("close", globalCode => {
+            if (globalCode === 0) {
+              const driver = Buffer.concat(globalChunks).toString().trim()
+              if (driver.includes("package-conflicts-resolver merge-driver")) {
+                console.log("✅ Git merge driver is configured (global)")
+                console.log(`   Driver: ${driver}`)
+                console.log("   ℹ️  Global config affects all repositories")
+              } else {
+                console.log("⚠️  Git merge driver is configured (global) but may be incorrect:")
+                console.log(`   Driver: ${driver}`)
+                hasErrors = true
+              }
+            } else {
+              console.log("❌ Git merge driver is NOT configured")
+              console.log("   Run: package-conflicts-resolver setup")
+              hasErrors = true
+            }
+            resolve()
+          })
+
+          globalProcess.on("error", () => {
+            console.log("❌ Failed to check global git config")
+            hasErrors = true
+            resolve()
+          })
         }
       })
-      gitProcess.on("error", () => {
-        console.log("❌ Failed to check git config")
+      localProcess.on("error", () => {
+        console.log("❌ Failed to check local git config")
         hasErrors = true
         resolve()
       })
@@ -396,7 +443,7 @@ async function verifySetup(): Promise<void> {
     hasErrors = true
   }
 
-  // Check .gitattributes
+  // Check .gitattributes (only relevant for local setup)
   try {
     const content = await readFile(".gitattributes", "utf8")
     const lines = content.split("\n")
@@ -415,8 +462,7 @@ async function verifySetup(): Promise<void> {
     }
   } catch {
     console.log("⚠️  .gitattributes file not found")
-    console.log("   Run: package-conflicts-resolver setup")
-    hasErrors = true
+    console.log("   ℹ️  .gitattributes is only needed for local repository setup")
   }
 
   // Check if package-conflicts-resolver is accessible
@@ -451,6 +497,198 @@ async function verifySetup(): Promise<void> {
     console.log("✅ All checks passed! Git integration is set up correctly.")
     console.log("\nThe tool will now automatically resolve conflicts in package.json")
     console.log("and package-lock.json during Git merges.")
+  }
+}
+
+/**
+ * Uninstall Git integration
+ */
+async function uninstallGitIntegration(global: boolean, force: boolean): Promise<void> {
+  const scope = global ? "--global" : "--local"
+
+  console.log(`🗑️  Uninstalling Git integration ${global ? "globally" : "locally"}...`)
+
+  // Check what configurations exist
+  let hasLocal = false
+  let hasGlobal = false
+
+  try {
+    // Check local config
+    const localCheck = spawn("git", ["config", "--local", "merge.package-conflicts-resolver.driver"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    await new Promise<void>(resolve => {
+      localCheck.on("close", code => {
+        hasLocal = code === 0
+        resolve()
+      })
+      localCheck.on("error", () => resolve())
+    })
+
+    // Check global config
+    const globalCheck = spawn("git", ["config", "--global", "merge.package-conflicts-resolver.driver"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    await new Promise<void>(resolve => {
+      globalCheck.on("close", code => {
+        hasGlobal = code === 0
+        resolve()
+      })
+      globalCheck.on("error", () => resolve())
+    })
+  } catch {
+    // Ignore errors when checking
+  }
+
+  // Provide informative message about what will be removed
+  if (global && hasLocal) {
+    console.log("⚠️  This will remove the global Git configuration.")
+    console.log("   The local repository configuration will remain unchanged.")
+  } else if (!global && hasGlobal && !hasLocal) {
+    console.log("ℹ️  Only global configuration found. Use --global to remove it.")
+    console.log("   Or run: package-conflicts-resolver uninstall --global")
+    return
+  } else if (!global && !hasLocal && !hasGlobal) {
+    console.log("ℹ️  No Git merge driver configuration found to remove.")
+    return
+  }
+
+  if (!force) {
+    console.log("\n⚠️  This will:")
+    console.log("   • Remove Git merge driver configuration")
+    if (!global) {
+      console.log("   • Remove package-conflicts-resolver entries from .gitattributes")
+    }
+    console.log("\nProceed? (y/N)")
+
+    // Simple confirmation - in a real implementation you might want to use a library like inquirer
+    const {createInterface} = await import("readline")
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    })
+
+    const answer = await new Promise<string>(resolve => {
+      rl.question("", answer => {
+        rl.close()
+        resolve(answer.toLowerCase())
+      })
+    })
+
+    if (!["y", "yes"].includes(answer)) {
+      console.log("❌ Uninstallation cancelled.")
+      return
+    }
+  }
+
+  let hasErrors = false
+
+  // Remove Git merge driver configuration
+  try {
+    console.log("\n🔧 Removing Git merge driver configuration...")
+
+    // Remove the driver command
+    const driverProcess = spawn("git", ["config", "--unset", scope, "merge.package-conflicts-resolver.driver"])
+    await new Promise<void>((resolve, reject) => {
+      driverProcess.on("close", code => {
+        if (code === 0 || code === 1) {
+          // 1 means the key didn't exist, which is fine
+          console.log("✅ Removed merge driver configuration")
+          resolve()
+        } else {
+          console.log(`❌ Failed to remove merge driver configuration (exit code ${code})`)
+          hasErrors = true
+          resolve()
+        }
+      })
+      driverProcess.on("error", () => {
+        console.log("❌ Failed to remove merge driver configuration")
+        hasErrors = true
+        resolve()
+      })
+    })
+
+    // Remove the driver name (optional, don't fail if it doesn't exist)
+    const nameProcess = spawn("git", ["config", "--unset", scope, "merge.package-conflicts-resolver.name"])
+    await new Promise<void>(resolve => {
+      nameProcess.on("close", code => {
+        if (code === 0) {
+          console.log("✅ Removed merge driver name")
+        } else if (code === 1) {
+          // Key didn't exist, which is fine
+          console.log("✅ Merge driver name was not set")
+        }
+        resolve()
+      })
+      nameProcess.on("error", () => resolve()) // Ignore errors for optional cleanup
+    })
+  } catch (error) {
+    console.log(`❌ Failed to remove Git merge driver: ${error instanceof Error ? error.message : String(error)}`)
+    hasErrors = true
+  }
+
+  // Remove entries from .gitattributes (only for local uninstall)
+  if (!global) {
+    try {
+      console.log("\n📝 Cleaning up .gitattributes file...")
+      await cleanupGitattributes()
+    } catch (error) {
+      console.log(`❌ Failed to clean .gitattributes: ${error instanceof Error ? error.message : String(error)}`)
+      hasErrors = true
+    }
+  }
+
+  console.log()
+  if (hasErrors) {
+    console.log("❌ Uninstallation completed with errors. Some components may not have been removed.")
+    process.exit(1)
+  } else {
+    console.log("✅ Git integration successfully uninstalled!")
+    if (!global) {
+      console.log("\nTo verify removal, run: package-conflicts-resolver verify")
+    }
+  }
+}
+
+/**
+ * Remove package-conflicts-resolver entries from .gitattributes file
+ */
+async function cleanupGitattributes(): Promise<void> {
+  const gitattributesPath = ".gitattributes"
+  const entriesToRemove = [
+    "package.json merge=package-conflicts-resolver",
+    "package-lock.json merge=package-conflicts-resolver",
+  ]
+
+  try {
+    const content = await readFile(gitattributesPath, "utf8")
+    const lines = content.split("\n")
+    const filteredLines = lines.filter(line => {
+      const trimmedLine = line.trim()
+      return !entriesToRemove.includes(trimmedLine)
+    })
+
+    if (filteredLines.length !== lines.length) {
+      const {writeFile} = await import("fs/promises")
+      await writeFile(gitattributesPath, filteredLines.join("\n"), "utf8")
+
+      const removedCount = lines.length - filteredLines.length
+      console.log(`✅ Removed ${removedCount} package-conflicts-resolver entries from .gitattributes`)
+
+      // Check if file is now empty and offer to remove it
+      if (filteredLines.join("\n").trim() === "") {
+        console.log("ℹ️  .gitattributes file is now empty.")
+        console.log("   You may want to remove it if it's no longer needed.")
+      }
+    } else {
+      console.log("✅ No package-conflicts-resolver entries found in .gitattributes")
+    }
+  } catch (error) {
+    if ((error as any).code === "ENOENT") {
+      console.log("✅ .gitattributes file does not exist (nothing to clean up)")
+    } else {
+      throw new Error(`Failed to clean .gitattributes: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
 }
 
