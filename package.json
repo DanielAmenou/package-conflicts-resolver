@@ -40,6 +40,11 @@
   ],
   "author": "",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DanielAmenou/package-conflicts-resolver.git"
+  },
+  "homepage": "https://github.com/DanielAmenou/package-conflicts-resolver/blob/main/README.md",
   "engines": {
     "node": ">=20.0.0"
   },
