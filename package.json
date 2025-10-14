@@ -1,6 +1,6 @@
 {
   "name": "package-conflicts-resolver",
-  "version": "0.0.2-beta.1",
+  "version": "0.0.2",
   "description": "A Node.js CLI tool that automatically resolves conflicts in package.json and package-lock.json files",
   "main": "dist/index.js",
   "bin": {
