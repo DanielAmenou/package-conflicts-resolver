@@ -7,12 +7,8 @@
 import {Command} from "commander"
 import {readFile, access} from "fs/promises"
 import {spawn} from "child_process"
-import {promisify} from "util"
 import {PackageResolver} from "./package-resolver.js"
-import {Logger} from "./logger.js"
 import {RESOLUTION_STRATEGIES, CliOptions} from "./types.js"
-
-const execAsync = promisify(spawn)
 
 async function main() {
   const program = new Command()
