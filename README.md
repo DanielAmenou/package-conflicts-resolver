@@ -17,12 +17,26 @@ npm install -g package-conflicts-resolver
 
 # Local installation
 npm install --save-dev package-conflicts-resolver
-
-# Use with npx (no installation needed)
-npx package-conflicts-resolver
 ```
 
 ## Usage
+
+### Quick Setup (Recommended)
+
+Set up automatic conflict resolution during Git merges:
+
+```bash
+# Install globally (recommended for setup)
+npm install -g package-conflicts-resolver
+
+# Setup for current repository (automatically creates/updates .gitattributes)
+package-conflicts-resolver setup
+
+# Verify the setup is working
+package-conflicts-resolver verify
+```
+
+That's it! The tool will now automatically resolve conflicts in `package.json` and `package-lock.json` during Git merges.
 
 ### Basic Usage
 
@@ -71,28 +85,13 @@ package-conflicts-resolver verify           # Verify Git integration is working
 --skip-gitattributes          Skip automatic .gitattributes setup (for setup command)
 ```
 
-## Git Integration
-
-### Quick Setup (Recommended)
-
-Set up automatic conflict resolution during Git merges:
-
-```bash
-# Setup for current repository (automatically creates/updates .gitattributes)
-package-conflicts-resolver setup
-
-# Verify the setup is working
-package-conflicts-resolver verify
-```
-
-That's it! The tool will now automatically resolve conflicts in `package.json` and `package-lock.json` during Git merges.
-
 ### Global Setup
 
 For global setup across all repositories:
 
 ```bash
 # Setup globally
+npm install -g package-conflicts-resolver
 package-conflicts-resolver setup --global
 
 # Then run this in each repository to create .gitattributes
@@ -113,6 +112,8 @@ And configure the merge driver:
 ```bash
 git config merge.package-conflicts-resolver.driver "npx package-conflicts-resolver merge-driver %A %O %B"
 ```
+
+This configuration works without any installation since it uses `npx`.
 
 ### Removing Git Integration
 
