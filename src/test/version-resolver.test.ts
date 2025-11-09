@@ -64,6 +64,12 @@ describe("VersionResolver", () => {
       assert.equal(result.resolved, "1.0.0")
     })
 
+    test("should prefer stable version over pre-release even when pre-release has higher base version", () => {
+      const result = VersionResolver.resolveVersion("2.68.4-beta-new-cli.3", "2.68.6", "highest")
+      assert.equal(result.resolved, "2.68.6", "Should prefer stable 2.68.6 over pre-release 2.68.4-beta-new-cli.3")
+      assert(result.reason.includes("stable"))
+    })
+
     test("should handle non-semver versions gracefully", () => {
       const result = VersionResolver.resolveVersion("latest", "next", "highest")
       assert(result.resolved === "latest" || result.resolved === "next")

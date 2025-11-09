@@ -44,6 +44,25 @@ export class VersionResolver {
     try {
       // First try direct semver comparison (preserves pre-release)
       if (semver.valid(ourClean) && semver.valid(theirClean)) {
+        // Check if one is a pre-release and the other is stable
+        const ourIsPrerelease = semver.prerelease(ourClean) !== null
+        const theirIsPrerelease = semver.prerelease(theirClean) !== null
+
+        // Prefer stable versions over pre-release versions when using "highest" strategy
+        if (ourIsPrerelease && !theirIsPrerelease) {
+          return {
+            resolved: theirVersion,
+            reason: `their version ${theirClean} is stable, preferring over pre-release ${ourClean}`,
+          }
+        }
+        if (!ourIsPrerelease && theirIsPrerelease) {
+          return {
+            resolved: ourVersion,
+            reason: `our version ${ourClean} is stable, preferring over pre-release ${theirClean}`,
+          }
+        }
+
+        // Both are either stable or pre-release, use normal semver comparison
         const comparison = semver.compare(ourClean, theirClean)
         if (comparison > 0) {
           return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
