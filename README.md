@@ -30,10 +30,10 @@ Set up automatic conflict resolution during Git merges:
 npm install -g package-conflicts-resolver
 
 # Setup for current repository (automatically creates/updates .gitattributes)
-package-conflicts-resolver setup
+npx package-conflicts-resolver setup
 
 # Verify the setup is working
-package-conflicts-resolver verify
+npx package-conflicts-resolver verify
 ```
 
 That's it! The tool will now automatically resolve conflicts in `package.json` and `package-lock.json` during Git merges.
@@ -42,16 +42,16 @@ That's it! The tool will now automatically resolve conflicts in `package.json` a
 
 ```bash
 # Resolve conflicts in package.json
-package-conflicts-resolver
+npx package-conflicts-resolver
 
 # Resolve conflicts in specific file
-package-conflicts-resolver path/to/package.json
+npx package-conflicts-resolver path/to/package.json
 
 # Dry run to see what would be changed
-package-conflicts-resolver --dry-run
+npx package-conflicts-resolver --dry-run
 
 # Use different resolution strategy
-package-conflicts-resolver --strategy lowest
+npx package-conflicts-resolver --strategy lowest
 ```
 
 ### Resolution Strategies
@@ -66,11 +66,11 @@ package-conflicts-resolver --strategy lowest
 ```bash
 # Main commands
 package-conflicts-resolver [file]           # Resolve conflicts in file (default: package.json)
-package-conflicts-resolver setup            # Setup Git integration for current repository
-package-conflicts-resolver setup --global   # Setup Git integration globally
-package-conflicts-resolver uninstall        # Remove Git integration for current repository
-package-conflicts-resolver uninstall --global # Remove global Git integration
-package-conflicts-resolver verify           # Verify Git integration is working
+npx package-conflicts-resolver setup            # Setup Git integration for current repository
+npx package-conflicts-resolver setup --global   # Setup Git integration globally
+npx package-conflicts-resolver uninstall        # Remove Git integration for current repository
+npx package-conflicts-resolver uninstall --global # Remove global Git integration
+npx package-conflicts-resolver verify           # Verify Git integration is working
 ```
 
 ### Options

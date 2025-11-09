@@ -130,7 +130,13 @@ export class PackageResolver {
         // For simple fields, extract values directly
         const ourValue = this.extractFieldValue(conflict.ours, fieldName)
         const theirValue = this.extractFieldValue(conflict.theirs, fieldName)
-        return this.resolveSimpleConflict(fieldName, ourValue, theirValue)
+        const resolved = this.resolveSimpleConflict(fieldName, ourValue, theirValue)
+        
+        // Store original conflict content for formatting purposes (to preserve trailing commas)
+        resolved.originalOurs = conflict.ours
+        resolved.originalTheirs = conflict.theirs
+        
+        return resolved
       }
     } catch (error) {
       this.logger.error(`Failed to resolve conflict: ${error instanceof Error ? error.message : String(error)}`)
@@ -373,7 +379,14 @@ export class PackageResolver {
     } else {
       // For simple values, format as JSON property
       const value = resolved.resolvedValue.startsWith('"') ? resolved.resolvedValue : `"${resolved.resolvedValue}"`
-      return `  "${resolved.field}": ${value}`
+      
+      // Check if original content had trailing comma - if so, preserve it
+      const originalHadTrailingComma =
+        (resolved.originalOurs && resolved.originalOurs.trim().endsWith(",")) ||
+        (resolved.originalTheirs && resolved.originalTheirs.trim().endsWith(","))
+      
+      const comma = originalHadTrailingComma ? "," : ""
+      return `  "${resolved.field}": ${value}${comma}`
     }
   }
 
