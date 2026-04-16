@@ -5,8 +5,9 @@
  */
 
 import {Command} from "commander"
+import {spawn} from "node:child_process"
 import {readFile, access} from "fs/promises"
-import {spawn} from "child_process"
+import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
 import {RESOLUTION_STRATEGIES, CliOptions} from "./types.js"
 
@@ -66,7 +67,11 @@ async function main() {
     .option("-s, --strategy <strategy>", "Resolution strategy", "highest")
     .action(async (current: string, base: string, other: string, options: any) => {
       try {
-        const content = await readFile(current, "utf8")
+        const [currentContent, baseContent, otherContent] = await Promise.all([
+          readFile(current, "utf8"),
+          readFile(base, "utf8"),
+          readFile(other, "utf8"),
+        ])
 
         const cliOptions: CliOptions = {
           strategy: options.strategy,
@@ -79,7 +84,7 @@ async function main() {
         }
 
         const resolver = new PackageResolver(cliOptions)
-        const result = await resolver.resolveConflicts(content)
+        const result = await resolver.mergeJsonContents(baseContent, currentContent, otherContent)
 
         if (result.resolved && result.packageJson) {
           await resolver.writeResolvedPackage(result.packageJson, current)
@@ -158,7 +163,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
   const content = await readFile(filePath, "utf8")
 
   // Check if file has conflicts
-  if (!content.includes("<<<<<<< HEAD")) {
+  if (!ConflictParser.hasConflicts(content)) {
     if (!options.quiet) {
       if (options.json) {
         console.log(

@@ -2,6 +2,7 @@
  * Main package.json conflict resolver
  */
 
+import {isDeepStrictEqual} from "node:util"
 import {ConflictParser} from "./conflict-parser.js"
 import {VersionResolver} from "./version-resolver.js"
 import {Logger} from "./logger.js"
@@ -10,10 +11,14 @@ import {
   ConflictMarker,
   ResolutionResult,
   ResolvedConflict,
-  ResolutionStrategy,
   STABLE_PACKAGE_JSON_FIELDS,
   CliOptions,
 } from "./types.js"
+
+interface MergeOutcome {
+  value: any
+  conflicts: ResolvedConflict[]
+}
 
 export class PackageResolver {
   private logger: Logger
@@ -47,6 +52,17 @@ export class PackageResolver {
       }
 
       this.logger.info("Found conflicts in package.json, resolving...")
+
+      const semanticResult = this.resolveConflictVariants(content)
+      if (semanticResult) {
+        result.conflicts = semanticResult.conflicts
+        result.packageJson = semanticResult.packageJson
+        result.resolved = true
+
+        this.logger.success(`Resolved ${result.conflicts.length} conflicts`)
+        this.logger.logConflicts(result.conflicts)
+        return result
+      }
 
       // Parse conflicts
       const conflicts = ConflictParser.parseConflicts(content)
@@ -96,6 +112,70 @@ export class PackageResolver {
   }
 
   /**
+   * Merge full JSON documents using a semantic two-way merge.
+   * This is used for real Git conflict markers, where the surrounding JSON
+   * structure may be shared outside the conflict block.
+   */
+  private resolveConflictVariants(content: string): ResolutionResult | null {
+    try {
+      const ourContent = ConflictParser.extractConflictSide(content, "ours")
+      const theirContent = ConflictParser.extractConflictSide(content, "theirs")
+      const result = this.mergeJsonContentsInternal(ourContent, theirContent)
+      return result.resolved ? result : null
+    } catch (error) {
+      this.logger.debug("Semantic conflict resolution failed, falling back to block-based parser", {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return null
+    }
+  }
+
+  /**
+   * Merge base/current/other JSON contents for Git merge-driver usage.
+   */
+  async mergeJsonContents(
+    baseContent: string,
+    currentContent: string,
+    otherContent: string
+  ): Promise<ResolutionResult> {
+    return this.mergeJsonContentsInternal(currentContent, otherContent, baseContent)
+  }
+
+  /**
+   * Merge JSON contents, optionally with a base document for true three-way merges.
+   */
+  private mergeJsonContentsInternal(ourContent: string, theirContent: string, baseContent?: string): ResolutionResult {
+    const result: ResolutionResult = {
+      resolved: false,
+      conflicts: [],
+      errors: [],
+    }
+
+    try {
+      const ourDocument = JSON.parse(ourContent)
+      const theirDocument = JSON.parse(theirContent)
+      const baseDocument = baseContent ? JSON.parse(baseContent) : undefined
+
+      if (!this.isPlainObject(ourDocument) || !this.isPlainObject(theirDocument)) {
+        throw new Error("Expected JSON object documents")
+      }
+
+      if (baseDocument !== undefined && !this.isPlainObject(baseDocument)) {
+        throw new Error("Expected base document to be a JSON object")
+      }
+
+      const merged = this.mergeValue([], baseDocument, ourDocument, theirDocument)
+      result.conflicts = merged.conflicts
+      result.packageJson = this.finalizeMergedDocument(merged.value)
+      result.resolved = true
+    } catch (error) {
+      result.errors.push(error instanceof Error ? error.message : String(error))
+    }
+
+    return result
+  }
+
+  /**
    * Resolve a single conflict
    */
   private async resolveConflict(conflict: ConflictMarker, fullContent: string): Promise<ResolvedConflict | null> {
@@ -131,11 +211,11 @@ export class PackageResolver {
         const ourValue = this.extractFieldValue(conflict.ours, fieldName)
         const theirValue = this.extractFieldValue(conflict.theirs, fieldName)
         const resolved = this.resolveSimpleConflict(fieldName, ourValue, theirValue)
-        
+
         // Store original conflict content for formatting purposes (to preserve trailing commas)
         resolved.originalOurs = conflict.ours
         resolved.originalTheirs = conflict.theirs
-        
+
         return resolved
       }
     } catch (error) {
@@ -379,12 +459,12 @@ export class PackageResolver {
     } else {
       // For simple values, format as JSON property
       const value = resolved.resolvedValue.startsWith('"') ? resolved.resolvedValue : `"${resolved.resolvedValue}"`
-      
+
       // Check if original content had trailing comma - if so, preserve it
       const originalHadTrailingComma =
         (resolved.originalOurs && resolved.originalOurs.trim().endsWith(",")) ||
         (resolved.originalTheirs && resolved.originalTheirs.trim().endsWith(","))
-      
+
       const comma = originalHadTrailingComma ? "," : ""
       return `  "${resolved.field}": ${value}${comma}`
     }
@@ -426,5 +506,199 @@ export class PackageResolver {
       await fs.writeFile(filePath, content, "utf8")
       this.logger.success(`Wrote resolved package.json to ${filePath}`)
     }
+  }
+
+  private mergeValue(path: string[], baseValue: any, ourValue: any, theirValue: any): MergeOutcome {
+    if (ourValue === undefined && theirValue === undefined) {
+      return {value: undefined, conflicts: []}
+    }
+
+    const preferStrategyResolution = this.shouldResolveAsVersion(path, ourValue, theirValue)
+
+    if (!preferStrategyResolution && this.isUnchangedFromBase(ourValue, baseValue)) {
+      return {value: theirValue, conflicts: []}
+    }
+
+    if (!preferStrategyResolution && this.isUnchangedFromBase(theirValue, baseValue)) {
+      return {value: ourValue, conflicts: []}
+    }
+
+    if (ourValue === undefined) {
+      return {value: theirValue, conflicts: []}
+    }
+
+    if (theirValue === undefined) {
+      return {value: ourValue, conflicts: []}
+    }
+
+    if (isDeepStrictEqual(ourValue, theirValue)) {
+      return {value: ourValue, conflicts: []}
+    }
+
+    if (this.isPlainObject(ourValue) && this.isPlainObject(theirValue)) {
+      return this.mergeObjectValues(path, this.asPlainObject(baseValue), ourValue, theirValue)
+    }
+
+    if (Array.isArray(ourValue) && Array.isArray(theirValue)) {
+      return this.mergeArrayValues(path, baseValue, ourValue, theirValue)
+    }
+
+    return this.resolveLeafConflict(path, ourValue, theirValue)
+  }
+
+  private mergeObjectValues(
+    path: string[],
+    baseValue: Record<string, any> | undefined,
+    ourValue: Record<string, any>,
+    theirValue: Record<string, any>
+  ): MergeOutcome {
+    const merged: Record<string, any> = {}
+    const conflicts: ResolvedConflict[] = []
+    const keys = this.orderedUnion(Object.keys(ourValue), Object.keys(theirValue), Object.keys(baseValue || {}))
+
+    for (const key of keys) {
+      const mergedChild = this.mergeValue(path.concat(key), baseValue?.[key], ourValue[key], theirValue[key])
+      if (mergedChild.value !== undefined) {
+        merged[key] = mergedChild.value
+      }
+      conflicts.push(...mergedChild.conflicts)
+    }
+
+    return {value: merged, conflicts}
+  }
+
+  private mergeArrayValues(path: string[], baseValue: any, ourValue: any[], theirValue: any[]): MergeOutcome {
+    if (Array.isArray(baseValue)) {
+      if (isDeepStrictEqual(ourValue, baseValue)) {
+        return {value: theirValue, conflicts: []}
+      }
+      if (isDeepStrictEqual(theirValue, baseValue)) {
+        return {value: ourValue, conflicts: []}
+      }
+    }
+
+    if (ourValue.every(this.isPrimitiveValue) && theirValue.every(this.isPrimitiveValue)) {
+      const mergedArray = [...ourValue]
+      for (const item of theirValue) {
+        if (!mergedArray.some(existing => isDeepStrictEqual(existing, item))) {
+          mergedArray.push(item)
+        }
+      }
+
+      return {
+        value: mergedArray,
+        conflicts: [this.createConflictRecord(path, ourValue, theirValue, mergedArray)],
+      }
+    }
+
+    return this.resolveLeafConflict(path, ourValue, theirValue)
+  }
+
+  private resolveLeafConflict(path: string[], ourValue: any, theirValue: any): MergeOutcome {
+    const resolution = this.shouldResolveAsVersion(path, ourValue, theirValue)
+      ? VersionResolver.resolveVersion(String(ourValue), String(theirValue), this.options.strategy)
+      : VersionResolver.resolveNonVersion(ourValue, theirValue, this.options.strategy)
+
+    return {
+      value: resolution.resolved,
+      conflicts: [this.createConflictRecord(path, ourValue, theirValue, resolution.resolved)],
+    }
+  }
+
+  private createConflictRecord(path: string[], ourValue: any, theirValue: any, resolvedValue: any): ResolvedConflict {
+    return {
+      field: this.formatPath(path),
+      ourValue: this.stringifyConflictValue(ourValue),
+      theirValue: this.stringifyConflictValue(theirValue),
+      resolvedValue: this.stringifyConflictValue(resolvedValue),
+      strategy: this.options.strategy,
+    }
+  }
+
+  private finalizeMergedDocument(document: any): PackageJson {
+    if (!this.isPlainObject(document)) {
+      throw new Error("Merged document is not a JSON object")
+    }
+
+    if (this.shouldStabilizeFieldOrder(document)) {
+      return this.stabilizeFieldOrder(document as PackageJson)
+    }
+
+    return document as PackageJson
+  }
+
+  private isUnchangedFromBase(value: any, baseValue: any): boolean {
+    if (baseValue === undefined) {
+      return value === undefined
+    }
+
+    if (value === undefined) {
+      return false
+    }
+
+    return isDeepStrictEqual(value, baseValue)
+  }
+
+  private shouldResolveAsVersion(path: string[], ourValue: any, theirValue: any): boolean {
+    if (typeof ourValue !== "string" || typeof theirValue !== "string") {
+      return false
+    }
+
+    const currentKey = path[path.length - 1]
+    const parentKey = path[path.length - 2]
+
+    return currentKey === "version" || this.isDependencyField(parentKey || "")
+  }
+
+  private shouldStabilizeFieldOrder(document: Record<string, any>): boolean {
+    if ("lockfileVersion" in document || "packages" in document) {
+      return false
+    }
+
+    return Object.keys(document).some(key => STABLE_PACKAGE_JSON_FIELDS.includes(key as any))
+  }
+
+  private stringifyConflictValue(value: any): string {
+    if (value === undefined) {
+      return "<deleted>"
+    }
+
+    if (typeof value === "string") {
+      return value
+    }
+
+    return JSON.stringify(value)
+  }
+
+  private formatPath(path: string[]): string {
+    return path.length === 0 ? "root" : path.join(".")
+  }
+
+  private orderedUnion(...lists: string[][]): string[] {
+    const seen = new Set<string>()
+    const ordered: string[] = []
+
+    for (const list of lists) {
+      for (const item of list) {
+        if (!seen.has(item)) {
+          seen.add(item)
+          ordered.push(item)
+        }
+      }
+    }
+
+    return ordered
+  }
+
+  private isPlainObject(value: any): value is Record<string, any> {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+  }
+
+  private asPlainObject(value: any): Record<string, any> | undefined {
+    return this.isPlainObject(value) ? value : undefined
+  }
+
+  private isPrimitiveValue = (value: any): boolean => {
+    return value === null || ["string", "number", "boolean"].includes(typeof value)
   }
 }

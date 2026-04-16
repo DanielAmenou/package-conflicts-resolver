@@ -104,6 +104,41 @@ export class ConflictParser {
   }
 
   /**
+   * Build a clean document variant by selecting one side of every conflict.
+   */
+  static extractConflictSide(content: string, side: "ours" | "theirs"): string {
+    const lines = content.split("\n")
+    const conflicts = this.parseConflicts(content)
+    const result: string[] = []
+    let lastProcessedLine = 0
+
+    for (const conflict of conflicts) {
+      for (let i = lastProcessedLine; i < conflict.start; i++) {
+        const line = lines[i]
+        if (line !== undefined) {
+          result.push(line)
+        }
+      }
+
+      const selectedContent = side === "ours" ? conflict.ours : conflict.theirs
+      if (selectedContent.trim()) {
+        result.push(...selectedContent.split("\n"))
+      }
+
+      lastProcessedLine = conflict.end + 1
+    }
+
+    for (let i = lastProcessedLine; i < lines.length; i++) {
+      const line = lines[i]
+      if (line !== undefined) {
+        result.push(line)
+      }
+    }
+
+    return result.join("\n")
+  }
+
+  /**
    * Extract field name from conflict content (for package.json)
    * This looks for the parent field that contains the conflict
    */

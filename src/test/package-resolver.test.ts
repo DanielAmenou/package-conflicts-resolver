@@ -77,7 +77,7 @@ describe("PackageResolver", () => {
 
     assert.equal(result.resolved, true)
     assert.equal(result.conflicts.length, 1)
-    assert.equal(result.conflicts[0]!.field, "dependencies")
+    assert.equal(result.conflicts[0]!.field, "dependencies.lodash")
 
     // Should merge all dependencies and resolve version conflict
     const deps = result.packageJson?.dependencies
@@ -213,7 +213,9 @@ describe("PackageResolver", () => {
     const result = await resolver.resolveConflicts(content)
 
     assert.equal(result.resolved, true)
-    assert.equal(result.conflicts.length, 1) // Single conflict with multiple fields
+    assert.equal(result.conflicts.length, 2)
+    assert(result.conflicts.some(conflict => conflict.field === "version"))
+    assert(result.conflicts.some(conflict => conflict.field === "dependencies.lodash"))
   })
 
   test("should handle invalid JSON gracefully", async () => {
@@ -257,8 +259,9 @@ describe("PackageResolver", () => {
     const result = await resolver.resolveConflicts(content)
 
     assert.equal(result.resolved, true)
-    assert.equal(result.conflicts.length, 1)
-    assert.equal(result.conflicts[0]!.field, "dependencies")
+    assert.equal(result.conflicts.length, 2)
+    assert(result.conflicts.some(conflict => conflict.field === "dependencies.lodash"))
+    assert(result.conflicts.some(conflict => conflict.field === "dependencies.react"))
 
     // Get the dependencies in order
     const deps = result.packageJson?.dependencies
@@ -302,8 +305,9 @@ describe("PackageResolver", () => {
     const result = await resolver.resolveConflicts(content)
 
     assert.equal(result.resolved, true)
-    assert.equal(result.conflicts.length, 1)
-    assert.equal(result.conflicts[0]!.field, "scripts")
+    assert.equal(result.conflicts.length, 2)
+    assert(result.conflicts.some(conflict => conflict.field === "scripts.test"))
+    assert(result.conflicts.some(conflict => conflict.field === "scripts.lint"))
 
     // Get the scripts in order
     const scripts = result.packageJson?.scripts
