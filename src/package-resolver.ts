@@ -11,7 +11,6 @@ import {
   ConflictMarker,
   ResolutionResult,
   ResolvedConflict,
-  STABLE_PACKAGE_JSON_FIELDS,
   CliOptions,
 } from "./types.js"
 
@@ -91,7 +90,7 @@ export class PackageResolver {
 
         try {
           const parsedJson = JSON.parse(resolvedContent)
-          result.packageJson = this.stabilizeFieldOrder(parsedJson)
+          result.packageJson = parsedJson
           result.resolved = true
 
           this.logger.success(`Resolved ${result.conflicts.length} conflicts`)
@@ -471,29 +470,6 @@ export class PackageResolver {
   }
 
   /**
-   * Stabilize field order in package.json
-   */
-  private stabilizeFieldOrder(packageJson: PackageJson): PackageJson {
-    const ordered: PackageJson = {}
-
-    // Add stable fields in order
-    for (const field of STABLE_PACKAGE_JSON_FIELDS) {
-      if (packageJson[field] !== undefined) {
-        ;(ordered as any)[field] = packageJson[field]
-      }
-    }
-
-    // Add remaining fields
-    for (const [key, value] of Object.entries(packageJson)) {
-      if (!STABLE_PACKAGE_JSON_FIELDS.includes(key as any)) {
-        ordered[key] = value
-      }
-    }
-
-    return ordered
-  }
-
-  /**
    * Write resolved package.json to file
    */
   async writeResolvedPackage(packageJson: PackageJson, filePath: string): Promise<void> {
@@ -620,10 +596,6 @@ export class PackageResolver {
       throw new Error("Merged document is not a JSON object")
     }
 
-    if (this.shouldStabilizeFieldOrder(document)) {
-      return this.stabilizeFieldOrder(document as PackageJson)
-    }
-
     return document as PackageJson
   }
 
@@ -648,14 +620,6 @@ export class PackageResolver {
     const parentKey = path[path.length - 2]
 
     return currentKey === "version" || this.isDependencyField(parentKey || "")
-  }
-
-  private shouldStabilizeFieldOrder(document: Record<string, any>): boolean {
-    if ("lockfileVersion" in document || "packages" in document) {
-      return false
-    }
-
-    return Object.keys(document).some(key => STABLE_PACKAGE_JSON_FIELDS.includes(key as any))
   }
 
   private stringifyConflictValue(value: any): string {

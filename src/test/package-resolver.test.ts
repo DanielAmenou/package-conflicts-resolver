@@ -4,6 +4,9 @@
 
 import {strict as assert} from "assert"
 import {test, describe} from "node:test"
+import {mkdtemp, readFile, rm} from "fs/promises"
+import {tmpdir} from "os"
+import {join} from "path"
 import {PackageResolver} from "../package-resolver.js"
 import {CliOptions} from "../types.js"
 
@@ -151,7 +154,7 @@ describe("PackageResolver", () => {
     assert.equal(scripts.start, "node server.js") // from theirs
   })
 
-  test("should maintain stable field order", async () => {
+  test("should preserve top-level property order from the merged document", async () => {
     const content = `{
 <<<<<<< HEAD
   "version": "1.0.0",
@@ -180,17 +183,7 @@ describe("PackageResolver", () => {
     assert.equal(result.resolved, true)
 
     const keys = Object.keys(result.packageJson!)
-    const expectedOrder = ["name", "version", "scripts", "dependencies", "devDependencies"]
-
-    // Check that stable fields appear in the correct order
-    let lastIndex = -1
-    for (const field of expectedOrder) {
-      const index = keys.indexOf(field)
-      if (index !== -1) {
-        assert(index > lastIndex, `Field ${field} should come after previous stable fields`)
-        lastIndex = index
-      }
-    }
+    assert.deepEqual(keys, ["version", "name", "scripts", "dependencies", "devDependencies"])
   })
 
   test("should handle multiple conflicts", async () => {
@@ -334,6 +327,37 @@ describe("PackageResolver", () => {
       "lint should be from theirs (using highest strategy - prettier > eslint lexicographically)"
     )
     assert.equal(scripts.start, "node server.js", "start should be from theirs")
+  })
+
+  test("should write package.json without reordering properties", async () => {
+    const tempDir = await mkdtemp(join(tmpdir(), "package-resolver-"))
+    const filePath = join(tempDir, "package.json")
+
+    try {
+      const resolver = new PackageResolver(createTestOptions())
+      await resolver.writeResolvedPackage(
+        {
+          version: "1.0.0",
+          name: "test-package",
+          scripts: {
+            test: "jest",
+          },
+          dependencies: {
+            lodash: "^4.17.21",
+          },
+        },
+        filePath
+      )
+
+      const writtenContent = await readFile(filePath, "utf8")
+
+      assert.match(
+        writtenContent,
+        /"version": "1\.0\.0",\n  "name": "test-package",\n  "scripts": \{\n    "test": "jest"\n  \},\n  "dependencies": \{\n    "lodash": "\^4\.17\.21"\n  \}\n/
+      )
+    } finally {
+      await rm(tempDir, {recursive: true, force: true})
+    }
   })
 
   test("should handle empty conflicts", async () => {
