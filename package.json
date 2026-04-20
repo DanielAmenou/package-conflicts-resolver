@@ -44,6 +44,10 @@
     "type": "git",
     "url": "https://github.com/DanielAmenou/package-conflicts-resolver.git"
   },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/DanielAmenou"
+  },
   "homepage": "https://github.com/DanielAmenou/package-conflicts-resolver/blob/main/README.md",
   "engines": {
     "node": ">=20.0.0"

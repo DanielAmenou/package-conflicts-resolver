@@ -323,6 +323,10 @@ package-conflicts-resolver verify
 - npm (for package-lock.json regeneration)
 - Git 2.0+
 
+## Support
+
+If this tool saves you time, consider [sponsoring development on GitHub](https://github.com/sponsors/DanielAmenou).
+
 ## License
 
 MIT &copy; [Daniel Amenou](https://github.com/DanielAmenou)
