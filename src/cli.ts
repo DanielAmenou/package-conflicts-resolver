@@ -30,7 +30,7 @@ async function main() {
     .option("-q, --quiet", "Suppress output except errors", false)
     .option("-j, --json", "Output in JSON format", false)
     .option("-v, --verbose", "Enable verbose logging", false)
-    .option("--no-regenerate-lock", "Skip package-lock.json regeneration", false)
+    .option("--no-regenerate-lock", "Skip package-lock.json regeneration")
     .action(async (file: string, options: any) => {
       const cliOptions: CliOptions = {
         strategy: options.strategy,
