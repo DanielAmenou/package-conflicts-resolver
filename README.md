@@ -5,9 +5,12 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 ## Features
 
 - **Automatic conflict resolution** with configurable strategies
-- **Smart version resolution** using semver
+- **Smart version resolution** using semver (ranges, pre-releases, and non-registry specs like `workspace:`, `file:`, and git URLs are handled safely)
 - **Git integration** as merge driver or in hooks
-- **Stable JSON formatting** - preserves field order and structure
+- **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers (diff3 base sections enable true 3-way merges)
+- **Lockfile-safe merging** - `version`, `resolved`, and `integrity` of a package-lock entry are always kept together
+- **Stable JSON formatting** - preserves field order, indentation (tabs/spaces), and line endings (LF/CRLF)
+- **Cross-platform** - works on Linux, macOS, and Windows
 
 ## Installation
 

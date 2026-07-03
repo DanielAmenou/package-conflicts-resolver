@@ -6,10 +6,35 @@
 
 import {Command} from "commander"
 import {spawn} from "node:child_process"
+import {readFileSync} from "node:fs"
+import {join} from "node:path"
 import {readFile, access} from "fs/promises"
 import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
 import {RESOLUTION_STRATEGIES, CliOptions} from "./types.js"
+
+const IS_WINDOWS = process.platform === "win32"
+
+/**
+ * Read the tool version from its own package.json (single source of truth)
+ */
+function getToolVersion(): string {
+  try {
+    const packageJson = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf8"))
+    return typeof packageJson.version === "string" ? packageJson.version : "0.0.0"
+  } catch {
+    return "0.0.0"
+  }
+}
+
+/**
+ * Spawn a command cross-platform. On Windows, npm/npx are .cmd files and
+ * require a shell to execute (plain spawn fails with EINVAL on Node 20+).
+ */
+function spawnCommand(command: string, args: string[], options: Parameters<typeof spawn>[2] = {}) {
+  const needsShell = IS_WINDOWS && ["npm", "npx"].includes(command)
+  return spawn(command, args, {...options, shell: needsShell})
+}
 
 async function main() {
   const program = new Command()
@@ -17,7 +42,7 @@ async function main() {
   program
     .name("package-conflicts-resolver")
     .description("Automatically resolve conflicts in package.json and package-lock.json files")
-    .version("0.1.0")
+    .version(getToolVersion())
 
   program
     .argument("[file]", "Path to package.json file", "package.json")
@@ -67,6 +92,10 @@ async function main() {
     .option("-s, --strategy <strategy>", "Resolution strategy", "highest")
     .action(async (current: string, base: string, other: string, options: any) => {
       try {
+        // Fall back to the default strategy on invalid input: a merge driver
+        // should never hard-fail because of a bad flag
+        const strategy = Object.keys(RESOLUTION_STRATEGIES).includes(options.strategy) ? options.strategy : "highest"
+
         const [currentContent, baseContent, otherContent] = await Promise.all([
           readFile(current, "utf8"),
           readFile(base, "utf8"),
@@ -74,7 +103,7 @@ async function main() {
         ])
 
         const cliOptions: CliOptions = {
-          strategy: options.strategy,
+          strategy,
           dryRun: false,
           quiet: true,
           json: false,
@@ -87,12 +116,18 @@ async function main() {
         const result = await resolver.mergeJsonContents(baseContent, currentContent, otherContent)
 
         if (result.resolved && result.packageJson) {
-          await resolver.writeResolvedPackage(result.packageJson, current)
+          // Preserve the current file's indentation and line endings
+          await resolver.writeResolvedPackage(result.packageJson, current, currentContent)
           process.exit(0) // Success
         } else {
-          process.exit(1) // Conflict not resolved
+          // Non-zero exit tells Git the file is still conflicted
+          console.error(`package-conflicts-resolver: could not auto-resolve merge: ${result.errors.join(", ")}`)
+          process.exit(1)
         }
       } catch (error) {
+        console.error(
+          `package-conflicts-resolver: merge driver failed: ${error instanceof Error ? error.message : String(error)}`
+        )
         process.exit(1) // Error
       }
     })
@@ -200,8 +235,8 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
   }
 
   if (result.packageJson) {
-    // Write resolved package.json
-    await resolver.writeResolvedPackage(result.packageJson, filePath)
+    // Write resolved package.json (preserving original indentation/line endings)
+    await resolver.writeResolvedPackage(result.packageJson, filePath, content)
 
     // Regenerate package-lock.json if requested
     if (options.regenerateLock && !options.dryRun) {
@@ -221,7 +256,7 @@ async function regeneratePackageLock(quiet: boolean): Promise<void> {
   }
 
   try {
-    const npmProcess = spawn("npm", ["install", "--package-lock-only"], {
+    const npmProcess = spawnCommand("npm", ["install", "--package-lock-only"], {
       stdio: quiet ? "pipe" : "inherit",
     })
 
@@ -472,7 +507,7 @@ async function verifySetup(): Promise<void> {
 
   // Check if package-conflicts-resolver is accessible
   try {
-    const which = spawn("which", ["npx"], {stdio: ["pipe", "pipe", "pipe"]})
+    const which = spawnCommand(IS_WINDOWS ? "where" : "which", ["npx"], {stdio: ["pipe", "pipe", "pipe"]})
     await new Promise<void>((resolve, reject) => {
       which.on("close", code => {
         if (code === 0) {

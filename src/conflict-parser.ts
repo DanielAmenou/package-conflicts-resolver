@@ -4,51 +4,78 @@
 
 import {ConflictMarker} from "./types.js"
 
+export type ConflictSide = "ours" | "theirs" | "base"
+
 export class ConflictParser {
-  private static readonly CONFLICT_START = /^<{7} (.+)$/
-  private static readonly CONFLICT_MIDDLE = /^={7}$/
-  private static readonly CONFLICT_END = /^>{7} (.+)$/
+  // Labels after the markers are optional and CRLF line endings are tolerated.
+  private static readonly CONFLICT_START = /^<{7}(?:\s.*)?$/
+  private static readonly CONFLICT_BASE = /^\|{7}(?:\s.*)?$/
+  private static readonly CONFLICT_MIDDLE = /^={7}\s*$/
+  private static readonly CONFLICT_END = /^>{7}(?:\s.*)?$/
 
   /**
-   * Parse Git conflict markers in a file content
+   * Strip a trailing carriage return so markers are detected in CRLF files.
+   */
+  private static markerText(line: string): string {
+    return line.endsWith("\r") ? line.slice(0, -1) : line
+  }
+
+  /**
+   * Parse Git conflict markers in a file content.
+   * Supports both the default "merge" style and the "diff3"/"zdiff3" styles
+   * (which include a `|||||||` base section).
    */
   static parseConflicts(content: string): ConflictMarker[] {
     const lines = content.split("\n")
     const conflicts: ConflictMarker[] = []
     let currentConflict: Partial<ConflictMarker> | null = null
+    let baseMarkerSeen = false
     let oursLines: string[] = []
+    let baseLines: string[] = []
     let theirsLines: string[] = []
+
+    const reset = () => {
+      currentConflict = null
+      baseMarkerSeen = false
+      oursLines = []
+      baseLines = []
+      theirsLines = []
+    }
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i]
-      if (!line) continue
+      if (line === undefined) continue
+      const marker = this.markerText(line)
 
-      if (this.CONFLICT_START.test(line)) {
-        // Start of conflict
+      if (this.CONFLICT_START.test(marker)) {
+        // Start of conflict (a stray/nested start marker restarts parsing)
+        reset()
         currentConflict = {start: i}
-        oursLines = []
-        theirsLines = []
-      } else if (this.CONFLICT_MIDDLE.test(line) && currentConflict) {
+      } else if (this.CONFLICT_BASE.test(marker) && currentConflict && currentConflict.middle === undefined) {
+        // Start of diff3-style base section
+        baseMarkerSeen = true
+      } else if (this.CONFLICT_MIDDLE.test(marker) && currentConflict) {
         // Middle of conflict
         currentConflict.middle = i
-      } else if (this.CONFLICT_END.test(line) && currentConflict && currentConflict.middle !== undefined) {
+      } else if (this.CONFLICT_END.test(marker) && currentConflict && currentConflict.middle !== undefined) {
         // End of conflict
         currentConflict.end = i
         currentConflict.ours = oursLines.join("\n")
         currentConflict.theirs = theirsLines.join("\n")
+        if (baseMarkerSeen) {
+          currentConflict.base = baseLines.join("\n")
+        }
 
         conflicts.push(currentConflict as ConflictMarker)
-        currentConflict = null
-        oursLines = []
-        theirsLines = []
+        reset()
       } else if (currentConflict) {
-        // Content within conflict
-        if (currentConflict.middle === undefined) {
-          // Before middle marker (ours)
-          oursLines.push(line)
-        } else {
-          // After middle marker (theirs)
+        // Content within conflict (empty lines are preserved)
+        if (currentConflict.middle !== undefined) {
           theirsLines.push(line)
+        } else if (baseMarkerSeen) {
+          baseLines.push(line)
+        } else {
+          oursLines.push(line)
         }
       }
     }
@@ -61,6 +88,13 @@ export class ConflictParser {
    */
   static hasConflicts(content: string): boolean {
     return this.parseConflicts(content).length > 0
+  }
+
+  /**
+   * Check if any parsed conflict carries a diff3-style base section
+   */
+  static hasBaseSections(content: string): boolean {
+    return this.parseConflicts(content).some(conflict => conflict.base !== undefined)
   }
 
   /**
@@ -105,8 +139,9 @@ export class ConflictParser {
 
   /**
    * Build a clean document variant by selecting one side of every conflict.
+   * For "base", conflicts without a base section fall back to "ours".
    */
-  static extractConflictSide(content: string, side: "ours" | "theirs"): string {
+  static extractConflictSide(content: string, side: ConflictSide): string {
     const lines = content.split("\n")
     const conflicts = this.parseConflicts(content)
     const result: string[] = []
@@ -120,7 +155,15 @@ export class ConflictParser {
         }
       }
 
-      const selectedContent = side === "ours" ? conflict.ours : conflict.theirs
+      let selectedContent: string
+      if (side === "ours") {
+        selectedContent = conflict.ours
+      } else if (side === "theirs") {
+        selectedContent = conflict.theirs
+      } else {
+        selectedContent = conflict.base !== undefined ? conflict.base : conflict.ours
+      }
+
       if (selectedContent.trim()) {
         result.push(...selectedContent.split("\n"))
       }
@@ -229,9 +272,10 @@ export class ConflictParser {
       return JSON.parse(trimmed)
     }
 
-    // Try to parse as object property
+    // Try to parse as object property (with or without a trailing comma)
+    const withoutTrailingComma = trimmed.replace(/,\s*$/, "")
     try {
-      const wrapped = `{${trimmed}}`
+      const wrapped = `{${withoutTrailingComma}}`
       return JSON.parse(wrapped)
     } catch {
       // If still fails, try to extract key-value pairs

@@ -68,7 +68,9 @@ describe("CLI Integration Tests", () => {
     })
   }
 
-  async function createGitConflictRepo(useMergeDriver: boolean = false): Promise<{repoDir: string; defaultBranch: string}> {
+  async function createGitConflictRepo(
+    useMergeDriver: boolean = false
+  ): Promise<{repoDir: string; defaultBranch: string}> {
     const repoDir = await mkdtemp(join(tmpdir(), "package-conflicts-resolver-"))
 
     await runCommand("git", ["init"], repoDir)

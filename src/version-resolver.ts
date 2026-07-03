@@ -7,24 +7,29 @@ import {ResolutionStrategy} from "./types.js"
 
 export class VersionResolver {
   /**
-   * Resolve version conflict using the specified strategy
+   * Resolve version conflict using the specified strategy.
+   * Never throws: falls back to keeping our version for non-comparable specs
+   * (git URLs, file:, link:, workspace:, npm: aliases, dist-tags, etc.).
    */
   static resolveVersion(
     ourVersion: string,
     theirVersion: string,
     strategy: ResolutionStrategy["name"]
   ): {resolved: string; reason: string} {
-    switch (strategy) {
-      case "highest":
-        return this.resolveHighest(ourVersion, theirVersion)
-      case "lowest":
-        return this.resolveLowest(ourVersion, theirVersion)
-      case "ours":
-        return {resolved: ourVersion, reason: "using our version (ours strategy)"}
-      case "theirs":
-        return {resolved: theirVersion, reason: "using their version (theirs strategy)"}
-      default:
-        return this.resolveHighest(ourVersion, theirVersion)
+    try {
+      switch (strategy) {
+        case "ours":
+          return {resolved: ourVersion, reason: "using our version (ours strategy)"}
+        case "theirs":
+          return {resolved: theirVersion, reason: "using their version (theirs strategy)"}
+        case "lowest":
+          return this.resolveLowest(ourVersion, theirVersion)
+        case "highest":
+        default:
+          return this.resolveHighest(ourVersion, theirVersion)
+      }
+    } catch {
+      return {resolved: ourVersion, reason: "version comparison failed, keeping our version"}
     }
   }
 
@@ -40,60 +45,74 @@ export class VersionResolver {
       return {resolved: ourVersion, reason: "versions are identical"}
     }
 
-    // Try to compare as semver
-    try {
-      // First try direct semver comparison (preserves pre-release)
-      if (semver.valid(ourClean) && semver.valid(theirClean)) {
-        // Check if one is a pre-release and the other is stable
-        const ourIsPrerelease = semver.prerelease(ourClean) !== null
-        const theirIsPrerelease = semver.prerelease(theirClean) !== null
+    // 1. Direct semver comparison (preserves pre-release)
+    if (semver.valid(ourClean) && semver.valid(theirClean)) {
+      // Check if one is a pre-release and the other is stable
+      const ourIsPrerelease = semver.prerelease(ourClean) !== null
+      const theirIsPrerelease = semver.prerelease(theirClean) !== null
 
-        // Prefer stable versions over pre-release versions when using "highest" strategy
-        if (ourIsPrerelease && !theirIsPrerelease) {
-          return {
-            resolved: theirVersion,
-            reason: `their version ${theirClean} is stable, preferring over pre-release ${ourClean}`,
-          }
+      // Prefer stable versions over pre-release versions when using "highest" strategy
+      if (ourIsPrerelease && !theirIsPrerelease) {
+        return {
+          resolved: theirVersion,
+          reason: `their version ${theirClean} is stable, preferring over pre-release ${ourClean}`,
         }
-        if (!ourIsPrerelease && theirIsPrerelease) {
-          return {
-            resolved: ourVersion,
-            reason: `our version ${ourClean} is stable, preferring over pre-release ${theirClean}`,
-          }
-        }
-
-        // Both are either stable or pre-release, use normal semver comparison
-        const comparison = semver.compare(ourClean, theirClean)
-        if (comparison > 0) {
-          return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
-        } else if (comparison < 0) {
-          return {resolved: theirVersion, reason: `their version ${theirClean} is higher than ${ourClean}`}
-        } else {
-          return {resolved: ourVersion, reason: "versions are identical"}
+      }
+      if (!ourIsPrerelease && theirIsPrerelease) {
+        return {
+          resolved: ourVersion,
+          reason: `our version ${ourClean} is stable, preferring over pre-release ${theirClean}`,
         }
       }
 
-      // Fall back to coerced comparison for invalid semver
-      const ourSemver = semver.coerce(ourClean)
-      const theirSemver = semver.coerce(theirClean)
-
-      if (ourSemver && theirSemver) {
-        const comparison = semver.compare(ourSemver, theirSemver)
-        if (comparison > 0) {
-          return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
-        } else if (comparison < 0) {
-          return {resolved: theirVersion, reason: `their version ${theirClean} is higher than ${ourClean}`}
-        } else {
-          // Semver versions are equal, prefer the one with more specific range
-          return this.preferMoreSpecific(ourVersion, theirVersion)
-        }
+      // Both are either stable or pre-release, use normal semver comparison
+      const comparison = semver.compare(ourClean, theirClean)
+      if (comparison > 0) {
+        return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
+      } else if (comparison < 0) {
+        return {resolved: theirVersion, reason: `their version ${theirClean} is higher than ${ourClean}`}
+      } else {
+        return {resolved: ourVersion, reason: "versions are identical"}
       }
-    } catch (error) {
-      // Fall back to string comparison if semver fails
     }
 
-    // Fall back to lexicographic comparison
-    return this.lexicographicComparison(ourVersion, theirVersion, "highest")
+    // 2. Compare as semver ranges (handles "*", "1.x", ">=1.0.0 <2.0.0", "1.2.3 - 2.0.0", ...)
+    const rangeComparison = this.compareAsRanges(ourVersion, theirVersion)
+    if (rangeComparison !== null) {
+      if (rangeComparison > 0) {
+        return {resolved: ourVersion, reason: `our range ${ourVersion} allows a higher minimum than ${theirVersion}`}
+      } else if (rangeComparison < 0) {
+        return {
+          resolved: theirVersion,
+          reason: `their range ${theirVersion} allows a higher minimum than ${ourVersion}`,
+        }
+      }
+      // Ranges have equal minimums, prefer the one with more specific range
+      return this.preferMoreSpecific(ourVersion, theirVersion)
+    }
+
+    // 3. Coerced comparison for near-semver strings ("v1.2", "1.2.3.4", ...)
+    const ourSemver = semver.coerce(ourClean)
+    const theirSemver = semver.coerce(theirClean)
+
+    if (ourSemver && theirSemver) {
+      const comparison = semver.compare(ourSemver, theirSemver)
+      if (comparison > 0) {
+        return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
+      } else if (comparison < 0) {
+        return {resolved: theirVersion, reason: `their version ${theirClean} is higher than ${ourClean}`}
+      } else {
+        // Semver versions are equal, prefer the one with more specific range
+        return this.preferMoreSpecific(ourVersion, theirVersion)
+      }
+    }
+
+    // 4. Non-comparable specs (git URLs, file:, workspace:, dist-tags, ...):
+    // keep our version deterministically instead of guessing.
+    return {
+      resolved: ourVersion,
+      reason: `versions are not comparable ("${ourVersion}" vs "${theirVersion}"), keeping our version`,
+    }
   }
 
   /**
@@ -108,41 +127,75 @@ export class VersionResolver {
       return {resolved: ourVersion, reason: "versions are identical"}
     }
 
-    // Try to compare as semver
-    try {
-      // First try direct semver comparison (preserves pre-release)
-      if (semver.valid(ourClean) && semver.valid(theirClean)) {
-        const comparison = semver.compare(ourClean, theirClean)
-        if (comparison < 0) {
-          return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}
-        } else if (comparison > 0) {
-          return {resolved: theirVersion, reason: `their version ${theirClean} is lower than ${ourClean}`}
-        } else {
-          return {resolved: ourVersion, reason: "versions are identical"}
-        }
+    // 1. Direct semver comparison (preserves pre-release)
+    if (semver.valid(ourClean) && semver.valid(theirClean)) {
+      const comparison = semver.compare(ourClean, theirClean)
+      if (comparison < 0) {
+        return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}
+      } else if (comparison > 0) {
+        return {resolved: theirVersion, reason: `their version ${theirClean} is lower than ${ourClean}`}
+      } else {
+        return {resolved: ourVersion, reason: "versions are identical"}
       }
-
-      // Fall back to coerced comparison for invalid semver
-      const ourSemver = semver.coerce(ourClean)
-      const theirSemver = semver.coerce(theirClean)
-
-      if (ourSemver && theirSemver) {
-        const comparison = semver.compare(ourSemver, theirSemver)
-        if (comparison < 0) {
-          return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}
-        } else if (comparison > 0) {
-          return {resolved: theirVersion, reason: `their version ${theirClean} is lower than ${ourClean}`}
-        } else {
-          // Semver versions are equal, prefer the one with more restrictive range
-          return this.preferMoreRestrictive(ourVersion, theirVersion)
-        }
-      }
-    } catch (error) {
-      // Fall back to string comparison if semver fails
     }
 
-    // Fall back to lexicographic comparison
-    return this.lexicographicComparison(ourVersion, theirVersion, "lowest")
+    // 2. Compare as semver ranges
+    const rangeComparison = this.compareAsRanges(ourVersion, theirVersion)
+    if (rangeComparison !== null) {
+      if (rangeComparison < 0) {
+        return {resolved: ourVersion, reason: `our range ${ourVersion} allows a lower minimum than ${theirVersion}`}
+      } else if (rangeComparison > 0) {
+        return {resolved: theirVersion, reason: `their range ${theirVersion} allows a lower minimum than ${ourVersion}`}
+      }
+      // Ranges have equal minimums, prefer the one with more restrictive range
+      return this.preferMoreRestrictive(ourVersion, theirVersion)
+    }
+
+    // 3. Coerced comparison for near-semver strings
+    const ourSemver = semver.coerce(ourClean)
+    const theirSemver = semver.coerce(theirClean)
+
+    if (ourSemver && theirSemver) {
+      const comparison = semver.compare(ourSemver, theirSemver)
+      if (comparison < 0) {
+        return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}
+      } else if (comparison > 0) {
+        return {resolved: theirVersion, reason: `their version ${theirClean} is lower than ${ourClean}`}
+      } else {
+        // Semver versions are equal, prefer the one with more restrictive range
+        return this.preferMoreRestrictive(ourVersion, theirVersion)
+      }
+    }
+
+    // 4. Non-comparable specs: keep our version deterministically.
+    return {
+      resolved: ourVersion,
+      reason: `versions are not comparable ("${ourVersion}" vs "${theirVersion}"), keeping our version`,
+    }
+  }
+
+  /**
+   * Compare two specs as semver ranges using their minimum satisfying versions.
+   * Returns null when either side is not a valid range.
+   */
+  private static compareAsRanges(ourVersion: string, theirVersion: string): number | null {
+    try {
+      const ourRange = semver.validRange(ourVersion.trim(), {loose: true})
+      const theirRange = semver.validRange(theirVersion.trim(), {loose: true})
+      if (ourRange === null || theirRange === null) {
+        return null
+      }
+
+      const ourMin = semver.minVersion(ourRange)
+      const theirMin = semver.minVersion(theirRange)
+      if (!ourMin || !theirMin) {
+        return null
+      }
+
+      return semver.compare(ourMin, theirMin)
+    } catch {
+      return null
+    }
   }
 
   /**
@@ -150,7 +203,7 @@ export class VersionResolver {
    */
   private static cleanVersion(version: string): string {
     if (typeof version !== "string") {
-      return String(version || "")
+      return String(version ?? "")
     }
     return version.replace(/^[\^~>=<\s]+/, "").trim()
   }
@@ -225,32 +278,7 @@ export class VersionResolver {
   }
 
   /**
-   * Lexicographic comparison fallback
-   */
-  private static lexicographicComparison(
-    ourVersion: string,
-    theirVersion: string,
-    preference: "highest" | "lowest"
-  ): {resolved: string; reason: string} {
-    const comparison = ourVersion.localeCompare(theirVersion)
-
-    if (preference === "highest") {
-      if (comparison > 0) {
-        return {resolved: ourVersion, reason: "our version is lexicographically higher"}
-      } else {
-        return {resolved: theirVersion, reason: "their version is lexicographically higher"}
-      }
-    } else {
-      if (comparison < 0) {
-        return {resolved: ourVersion, reason: "our version is lexicographically lower"}
-      } else {
-        return {resolved: theirVersion, reason: "their version is lexicographically lower"}
-      }
-    }
-  }
-
-  /**
-   * Resolve non-version conflicts (strings, objects, etc.)
+   * Resolve non-version conflicts (strings, numbers, objects, etc.)
    */
   static resolveNonVersion(
     ourValue: any,
@@ -263,8 +291,16 @@ export class VersionResolver {
       case "theirs":
         return {resolved: theirValue, reason: "using their value (theirs strategy)"}
       case "highest":
-      case "lowest":
-        // For non-version values, fall back to string comparison or merge logic
+      case "lowest": {
+        // Numeric values (e.g. lockfileVersion) compare numerically
+        if (typeof ourValue === "number" && typeof theirValue === "number") {
+          const preferOurs = strategy === "highest" ? ourValue >= theirValue : ourValue <= theirValue
+          return preferOurs
+            ? {resolved: ourValue, reason: `our value is numerically ${strategy}`}
+            : {resolved: theirValue, reason: `their value is numerically ${strategy}`}
+        }
+
+        // For strings, fall back to lexicographic comparison
         if (typeof ourValue === "string" && typeof theirValue === "string") {
           const comparison = ourValue.localeCompare(theirValue)
           const preferOurs = strategy === "highest" ? comparison > 0 : comparison < 0
@@ -273,8 +309,9 @@ export class VersionResolver {
             : {resolved: theirValue, reason: `their value is lexicographically ${strategy}`}
         }
 
-        // For objects, prefer ours as default
+        // For objects and mixed types, prefer ours as default
         return {resolved: ourValue, reason: "non-version conflict, keeping our value"}
+      }
       default:
         return {resolved: ourValue, reason: "unknown strategy, keeping our value"}
     }

@@ -23,6 +23,8 @@ export interface ConflictMarker {
   end: number
   ours: string
   theirs: string
+  /** Base content when the conflict uses diff3/zdiff3 style (`|||||||` section) */
+  base?: string
   field?: string
 }
 

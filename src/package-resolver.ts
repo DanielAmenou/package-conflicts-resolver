@@ -6,13 +6,7 @@ import {isDeepStrictEqual} from "node:util"
 import {ConflictParser} from "./conflict-parser.js"
 import {VersionResolver} from "./version-resolver.js"
 import {Logger} from "./logger.js"
-import {
-  PackageJson,
-  ConflictMarker,
-  ResolutionResult,
-  ResolvedConflict,
-  CliOptions,
-} from "./types.js"
+import {PackageJson, ConflictMarker, ResolutionResult, ResolvedConflict, CliOptions} from "./types.js"
 
 interface MergeOutcome {
   value: any
@@ -41,6 +35,9 @@ export class PackageResolver {
       conflicts: [],
       errors: [],
     }
+
+    // Strip UTF-8 BOM so JSON parsing works for files saved by Windows editors
+    content = this.stripBom(content)
 
     try {
       // Check if there are any conflicts
@@ -119,7 +116,11 @@ export class PackageResolver {
     try {
       const ourContent = ConflictParser.extractConflictSide(content, "ours")
       const theirContent = ConflictParser.extractConflictSide(content, "theirs")
-      const result = this.mergeJsonContentsInternal(ourContent, theirContent)
+      // diff3/zdiff3 conflict styles carry the common ancestor: use it for a true 3-way merge
+      const baseContent = ConflictParser.hasBaseSections(content)
+        ? ConflictParser.extractConflictSide(content, "base")
+        : undefined
+      const result = this.mergeJsonContentsInternal(ourContent, theirContent, baseContent)
       return result.resolved ? result : null
     } catch (error) {
       this.logger.debug("Semantic conflict resolution failed, falling back to block-based parser", {
@@ -151,9 +152,33 @@ export class PackageResolver {
     }
 
     try {
-      const ourDocument = JSON.parse(ourContent)
-      const theirDocument = JSON.parse(theirContent)
-      const baseDocument = baseContent ? JSON.parse(baseContent) : undefined
+      const ourText = this.stripBom(ourContent)
+      const theirText = this.stripBom(theirContent)
+      const baseText = baseContent !== undefined ? this.stripBom(baseContent) : undefined
+
+      const ourIsBlank = ourText.trim() === ""
+      const theirIsBlank = theirText.trim() === ""
+
+      if (ourIsBlank && theirIsBlank) {
+        throw new Error("Both documents are empty")
+      }
+
+      // A side can be empty (e.g. file added on only one branch): take the other side
+      const ourDocument = ourIsBlank ? undefined : JSON.parse(ourText)
+      const theirDocument = theirIsBlank ? undefined : JSON.parse(theirText)
+
+      if (ourDocument === undefined || theirDocument === undefined) {
+        const survivor = ourDocument !== undefined ? ourDocument : theirDocument
+        if (!this.isPlainObject(survivor)) {
+          throw new Error("Expected JSON object documents")
+        }
+        result.packageJson = survivor as PackageJson
+        result.resolved = true
+        return result
+      }
+
+      // Empty base (e.g. file added on both branches) means "no common ancestor"
+      const baseDocument = baseText !== undefined && baseText.trim() !== "" ? JSON.parse(baseText) : undefined
 
       if (!this.isPlainObject(ourDocument) || !this.isPlainObject(theirDocument)) {
         throw new Error("Expected JSON object documents")
@@ -234,9 +259,9 @@ export class PackageResolver {
     let theirDeps: Record<string, string> = {}
 
     // If the data is already an object with the field name, extract it
-    if (typeof ourData === "object" && ourData[fieldName]) {
+    if (this.isPlainObject(ourData) && ourData[fieldName]) {
       ourDeps = ourData[fieldName]
-    } else if (typeof ourData === "object") {
+    } else if (this.isPlainObject(ourData)) {
       // If it's a direct dependency object
       ourDeps = ourData
     } else {
@@ -246,9 +271,9 @@ export class PackageResolver {
       return this.resolveSimpleConflict(fieldName, ourValue, theirValue)
     }
 
-    if (typeof theirData === "object" && theirData[fieldName]) {
+    if (this.isPlainObject(theirData) && theirData[fieldName]) {
       theirDeps = theirData[fieldName]
-    } else if (typeof theirData === "object") {
+    } else if (this.isPlainObject(theirData)) {
       theirDeps = theirData
     }
 
@@ -300,11 +325,30 @@ export class PackageResolver {
    * Resolve node_modules conflicts (for package-lock.json)
    */
   private resolveNodeModulesConflict(fieldName: string, ourData: any, theirData: any): ResolvedConflict | null {
-    if (typeof ourData !== "object" || typeof theirData !== "object") {
+    if (!this.isPlainObject(ourData) || !this.isPlainObject(theirData)) {
       // Fall back to simple resolution for non-object data
       const ourValue = typeof ourData === "object" ? JSON.stringify(ourData) : String(ourData)
       const theirValue = typeof theirData === "object" ? JSON.stringify(theirData) : String(theirData)
       return this.resolveSimpleConflict(fieldName, ourValue, theirValue)
+    }
+
+    // Lock entries with different versions are resolved atomically so that
+    // version/resolved/integrity never get mixed between the two sides.
+    if (
+      this.isLockPackageEntry(ourData) &&
+      this.isLockPackageEntry(theirData) &&
+      ourData.version !== theirData.version
+    ) {
+      const resolution = VersionResolver.resolveVersion(ourData.version, theirData.version, this.options.strategy)
+      const winner = resolution.resolved === theirData.version ? theirData : ourData
+
+      return {
+        field: fieldName,
+        ourValue: JSON.stringify(ourData, null, 2),
+        theirValue: JSON.stringify(theirData, null, 2),
+        resolvedValue: JSON.stringify(winner, null, 2),
+        strategy: this.options.strategy,
+      }
     }
 
     // Merge node_modules entry, resolving field conflicts
@@ -352,41 +396,57 @@ export class PackageResolver {
    * Extract field value from conflict content
    */
   private extractFieldValue(content: string, fieldName: string): string {
-    // Look for the field in the content
-    const regex = new RegExp(`"${fieldName}"\\s*:\\s*(".*?"|[^,\\n}]+)`, "i")
+    // Look for the field in the content (field names may contain regex special chars)
+    const escapedFieldName = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    const regex = new RegExp(`"${escapedFieldName}"\\s*:\\s*(".*?"|[^,\\n}]+)`, "i")
     const match = content.match(regex)
 
     if (match && match[1]) {
-      let value = match[1].trim()
-      // Remove quotes if it's a string
-      if (value.startsWith('"') && value.endsWith('"')) {
-        value = value.slice(1, -1)
-      }
-      return value
+      // Return the raw JSON token (quotes preserved) so the value type survives formatting
+      return match[1].trim()
     }
 
     return content.trim()
   }
 
   /**
+   * Unquote a raw JSON string token for comparison purposes
+   */
+  private unquoteJsonToken(token: string): string {
+    const trimmed = token.trim()
+    if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
+      try {
+        return JSON.parse(trimmed)
+      } catch {
+        return trimmed.slice(1, -1)
+      }
+    }
+    return trimmed
+  }
+
+  /**
    * Resolve simple field conflicts (version, name, etc.)
    */
   private resolveSimpleConflict(fieldName: string, ourValue: string, theirValue: string): ResolvedConflict {
-    let resolvedValue: string
+    // Values may be raw JSON tokens; compare their unquoted forms, but keep the
+    // winning raw token so string/number/boolean types survive re-serialization.
+    const ourComparable = this.unquoteJsonToken(ourValue)
+    const theirComparable = this.unquoteJsonToken(theirValue)
 
+    let winnerIsTheirs: boolean
     if (fieldName === "version") {
-      const resolution = VersionResolver.resolveVersion(ourValue, theirValue, this.options.strategy)
-      resolvedValue = resolution.resolved
+      const resolution = VersionResolver.resolveVersion(ourComparable, theirComparable, this.options.strategy)
+      winnerIsTheirs = resolution.resolved === theirComparable && ourComparable !== theirComparable
     } else {
-      const resolution = VersionResolver.resolveNonVersion(ourValue, theirValue, this.options.strategy)
-      resolvedValue = String(resolution.resolved)
+      const resolution = VersionResolver.resolveNonVersion(ourComparable, theirComparable, this.options.strategy)
+      winnerIsTheirs = String(resolution.resolved) === theirComparable && ourComparable !== theirComparable
     }
 
     return {
       field: fieldName,
       ourValue,
       theirValue,
-      resolvedValue,
+      resolvedValue: winnerIsTheirs ? theirValue : ourValue,
       strategy: this.options.strategy,
     }
   }
@@ -395,6 +455,12 @@ export class PackageResolver {
    * Format resolved content for insertion
    */
   private formatResolvedContent(resolved: ResolvedConflict): string {
+    // When we couldn't determine the field, don't invent a key: keep one side verbatim
+    if (resolved.field === "unknown") {
+      const side = this.options.strategy === "theirs" ? resolved.originalTheirs : resolved.originalOurs
+      return side !== undefined ? side : resolved.resolvedValue
+    }
+
     if (this.isDependencyField(resolved.field) || resolved.field === "scripts") {
       // For dependency conflicts, format as the complete field with its content
       try {
@@ -420,8 +486,7 @@ export class PackageResolver {
         return lines.join("\n")
       } catch (error) {
         // Fallback to simple formatting
-        const value = resolved.resolvedValue.startsWith('"') ? resolved.resolvedValue : `"${resolved.resolvedValue}"`
-        return `  "${resolved.field}": ${value}`
+        return `  "${resolved.field}": ${this.formatJsonValue(resolved.resolvedValue)}`
       }
     } else if (resolved.field.startsWith("node_modules/")) {
       // For package-lock.json node_modules entries, format as multi-line object
@@ -457,7 +522,7 @@ export class PackageResolver {
       }
     } else {
       // For simple values, format as JSON property
-      const value = resolved.resolvedValue.startsWith('"') ? resolved.resolvedValue : `"${resolved.resolvedValue}"`
+      const value = this.formatJsonValue(resolved.resolvedValue)
 
       // Check if original content had trailing comma - if so, preserve it
       const originalHadTrailingComma =
@@ -470,10 +535,31 @@ export class PackageResolver {
   }
 
   /**
+   * Format a raw resolved value as valid JSON: booleans, numbers, null, objects
+   * and pre-quoted strings pass through; bare strings get properly escaped quotes.
+   */
+  private formatJsonValue(raw: string): string {
+    const trimmed = raw.trim()
+    try {
+      JSON.parse(trimmed)
+      return trimmed
+    } catch {
+      return JSON.stringify(trimmed)
+    }
+  }
+
+  /**
+   * Strip a UTF-8 byte order mark
+   */
+  private stripBom(content: string): string {
+    return content.charCodeAt(0) === 0xfeff ? content.slice(1) : content
+  }
+
+  /**
    * Write resolved package.json to file
    */
-  async writeResolvedPackage(packageJson: PackageJson, filePath: string): Promise<void> {
-    const content = JSON.stringify(packageJson, null, 2) + "\n"
+  async writeResolvedPackage(packageJson: PackageJson, filePath: string, originalContent?: string): Promise<void> {
+    const content = this.serializeDocument(packageJson, originalContent)
 
     if (this.options.dryRun) {
       this.logger.info(`Would write resolved package.json to ${filePath}`)
@@ -482,6 +568,35 @@ export class PackageResolver {
       await fs.writeFile(filePath, content, "utf8")
       this.logger.success(`Wrote resolved package.json to ${filePath}`)
     }
+  }
+
+  /**
+   * Serialize the document preserving the original file's indentation
+   * (tabs, 2 or 4 spaces), line endings (LF/CRLF) and trailing newline.
+   */
+  private serializeDocument(packageJson: PackageJson, originalContent?: string): string {
+    let indent: string | number = 2
+    let eol = "\n"
+    let trailingNewline = true
+
+    if (originalContent !== undefined && originalContent.length > 0) {
+      const indentMatch = originalContent.match(/^([ \t]+)\S/m)
+      if (indentMatch && indentMatch[1]) {
+        indent = indentMatch[1]
+      }
+      eol = originalContent.includes("\r\n") ? "\r\n" : "\n"
+      trailingNewline = /(?:\r?\n)\s*$/.test(originalContent)
+    }
+
+    let content = JSON.stringify(packageJson, null, indent)
+    if (eol !== "\n") {
+      content = content.replace(/\n/g, eol)
+    }
+    if (trailingNewline) {
+      content += eol
+    }
+
+    return content
   }
 
   private mergeValue(path: string[], baseValue: any, ourValue: any, theirValue: any): MergeOutcome {
@@ -509,6 +624,16 @@ export class PackageResolver {
 
     if (isDeepStrictEqual(ourValue, theirValue)) {
       return {value: ourValue, conflicts: []}
+    }
+
+    // Lockfile package entries must stay internally consistent: version, resolved
+    // and integrity belong together, so never merge them field-by-field.
+    if (
+      this.isLockPackageEntry(ourValue) &&
+      this.isLockPackageEntry(theirValue) &&
+      ourValue.version !== theirValue.version
+    ) {
+      return this.mergeLockPackageEntry(path, ourValue, theirValue)
     }
 
     if (this.isPlainObject(ourValue) && this.isPlainObject(theirValue)) {
@@ -568,6 +693,35 @@ export class PackageResolver {
     }
 
     return this.resolveLeafConflict(path, ourValue, theirValue)
+  }
+
+  /**
+   * A package-lock entry: has a string version plus resolved/integrity metadata.
+   */
+  private isLockPackageEntry(value: any): value is Record<string, any> {
+    return (
+      this.isPlainObject(value) &&
+      typeof value.version === "string" &&
+      (typeof value.resolved === "string" || typeof value.integrity === "string")
+    )
+  }
+
+  /**
+   * Resolve a lockfile entry conflict atomically: pick the side whose version
+   * wins under the strategy and keep all of its correlated fields together.
+   */
+  private mergeLockPackageEntry(
+    path: string[],
+    ourValue: Record<string, any>,
+    theirValue: Record<string, any>
+  ): MergeOutcome {
+    const resolution = VersionResolver.resolveVersion(ourValue.version, theirValue.version, this.options.strategy)
+    const winner = resolution.resolved === theirValue.version ? theirValue : ourValue
+
+    return {
+      value: winner,
+      conflicts: [this.createConflictRecord(path, ourValue, theirValue, winner)],
+    }
   }
 
   private resolveLeafConflict(path: string[], ourValue: any, theirValue: any): MergeOutcome {
