@@ -42,12 +42,12 @@ export class PackageResolver {
     try {
       // Check if there are any conflicts
       if (!ConflictParser.hasConflicts(content)) {
-        this.logger.info("No conflicts found in package.json")
+        this.logger.info("No conflicts found")
         result.resolved = true
         return result
       }
 
-      this.logger.info("Found conflicts in package.json, resolving...")
+      this.logger.info("Found conflicts, resolving...")
 
       const semanticResult = this.resolveConflictVariants(content)
       if (semanticResult) {
@@ -562,11 +562,11 @@ export class PackageResolver {
     const content = this.serializeDocument(packageJson, originalContent)
 
     if (this.options.dryRun) {
-      this.logger.info(`Would write resolved package.json to ${filePath}`)
+      this.logger.info(`Would write resolved file to ${filePath}`)
     } else {
       const fs = await import("fs/promises")
       await fs.writeFile(filePath, content, "utf8")
-      this.logger.success(`Wrote resolved package.json to ${filePath}`)
+      this.logger.success(`Wrote resolved file to ${filePath}`)
     }
   }
 

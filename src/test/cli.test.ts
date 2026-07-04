@@ -150,6 +150,99 @@ describe("CLI end-to-end", () => {
   })
 })
 
+const CONFLICTED_LOCK = [
+  "{",
+  '  "name": "app",',
+  "<<<<<<< HEAD",
+  '  "version": "1.1.0",',
+  "=======",
+  '  "version": "1.2.0",',
+  ">>>>>>> feature",
+  '  "lockfileVersion": 3,',
+  '  "packages": {}',
+  "}",
+  "",
+].join("\n")
+
+describe("CLI companion lockfile resolution", () => {
+  test("resolves package-lock.json alongside package.json in one run", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), CONFLICTED, "utf8")
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_LOCK, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+
+      const pkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8"))
+      const lock = JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8"))
+      assert.equal(pkg.version, "1.2.0")
+      assert.equal(lock.version, "1.2.0")
+      assert.equal(lock.lockfileVersion, 3)
+    })
+  })
+
+  test("resolves the lockfile even when package.json has no conflicts", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), '{\n  "name": "app",\n  "version": "1.2.0"\n}\n', "utf8")
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_LOCK, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+
+      const lock = JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8"))
+      assert.equal(lock.version, "1.2.0")
+    })
+  })
+
+  test("resolves a conflicted npm-shrinkwrap.json", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), CONFLICTED, "utf8")
+      await writeFile(join(dir, "npm-shrinkwrap.json"), CONFLICTED_LOCK, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+
+      const shrinkwrap = JSON.parse(await readFile(join(dir, "npm-shrinkwrap.json"), "utf8"))
+      assert.equal(shrinkwrap.version, "1.2.0")
+    })
+  })
+
+  test("leaves a clean lockfile byte-identical", async () => {
+    await withTempDir(async dir => {
+      const cleanLock = '{\n  "name": "app",\n  "lockfileVersion": 3,\n  "packages": {}\n}\n'
+      await writeFile(join(dir, "package.json"), CONFLICTED, "utf8")
+      await writeFile(join(dir, "package-lock.json"), cleanLock, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(await readFile(join(dir, "package-lock.json"), "utf8"), cleanLock)
+    })
+  })
+
+  test("dry run leaves the lockfile untouched", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), CONFLICTED, "utf8")
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_LOCK, "utf8")
+
+      const result = await runCli(["--dry-run", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(await readFile(join(dir, "package-lock.json"), "utf8"), CONFLICTED_LOCK)
+    })
+  })
+
+  test("targeting package-lock.json directly still works", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_LOCK, "utf8")
+
+      const result = await runCli(["package-lock.json", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+
+      const lock = JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8"))
+      assert.equal(lock.version, "1.2.0")
+    })
+  })
+})
+
 describe("CLI merge-driver (as invoked by Git)", () => {
   test("merges current/base/other and rewrites the current file", async () => {
     await withTempDir(async dir => {

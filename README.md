@@ -9,6 +9,7 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 - **Git integration** as merge driver or in hooks
 - **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers (diff3 base sections enable true 3-way merges)
 - **Lockfile-safe merging** - `version`, `resolved`, and `integrity` of a package-lock entry are always kept together
+- **npm, yarn, pnpm, and bun aware** - npm lockfiles are merged directly; conflicted `yarn.lock` / `pnpm-lock.yaml` / `bun.lock` files are delegated to their package manager (which resolves them automatically), and the tool never creates a lockfile for a package manager your project doesn't use
 - **Stable JSON formatting** - preserves field order, indentation (tabs/spaces), and line endings (LF/CRLF)
 - **Cross-platform** - works on Linux, macOS, and Windows
 
@@ -44,7 +45,7 @@ That's it! The tool will now automatically resolve conflicts in `package.json` a
 ### Basic Usage
 
 ```bash
-# Resolve conflicts in package.json
+# Resolve conflicts in package.json AND package-lock.json / npm-shrinkwrap.json
 npx package-conflicts-resolver
 
 # Resolve conflicts in specific file
@@ -56,6 +57,14 @@ npx package-conflicts-resolver --dry-run
 # Use different resolution strategy
 npx package-conflicts-resolver --strategy lowest
 ```
+
+When the target is a `package.json`, conflicted sibling lockfiles are detected and handled in the same run — even if `package.json` itself merged cleanly:
+
+- `package-lock.json` / `npm-shrinkwrap.json` are merged semantically, then regenerated with `npm install --package-lock-only`
+- `pnpm-lock.yaml` is fixed by running `pnpm install --lockfile-only` (pnpm resolves conflicted lockfiles automatically)
+- `yarn.lock` and `bun.lock` are left to their package manager: the tool prints the exact command (`yarn install` / `bun install`), since both resolve conflicted lockfiles automatically during install
+
+Regeneration only runs for lockfiles that already exist in your project, and can be skipped with `--no-regenerate-lock`.
 
 ### Resolution Strategies
 

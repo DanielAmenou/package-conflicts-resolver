@@ -7,10 +7,11 @@
 import {Command} from "commander"
 import {spawn} from "node:child_process"
 import {readFileSync} from "node:fs"
-import {join} from "node:path"
+import {basename, dirname, join, resolve} from "node:path"
 import {readFile, access} from "fs/promises"
 import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
+import {LOCKFILES, findLockfiles} from "./package-manager.js"
 import {RESOLUTION_STRATEGIES, CliOptions} from "./types.js"
 
 const IS_WINDOWS = process.platform === "win32"
@@ -28,12 +29,24 @@ function getToolVersion(): string {
 }
 
 /**
- * Spawn a command cross-platform. On Windows, npm/npx are .cmd files and
- * require a shell to execute (plain spawn fails with EINVAL on Node 20+).
+ * Spawn a command cross-platform. On Windows, package manager CLIs are .cmd
+ * shims and require a shell to execute (plain spawn fails with EINVAL on Node 20+).
  */
 function spawnCommand(command: string, args: string[], options: Parameters<typeof spawn>[2] = {}) {
-  const needsShell = IS_WINDOWS && ["npm", "npx"].includes(command)
+  const needsShell = IS_WINDOWS && ["npm", "npx", "yarn", "pnpm", "bun"].includes(command)
   return spawn(command, args, {...options, shell: needsShell})
+}
+
+/**
+ * Run a lockfile command (e.g. "npm install --package-lock-only").
+ * Resolves to false when the command fails or is not installed.
+ */
+function runLockfileCommand(cmd: {command: string; args: string[]}, cwd: string, quiet: boolean): Promise<boolean> {
+  return new Promise(resolvePromise => {
+    const child = spawnCommand(cmd.command, cmd.args, {stdio: quiet ? "pipe" : "inherit", cwd})
+    child.on("close", code => resolvePromise(code === 0))
+    child.on("error", () => resolvePromise(false))
+  })
 }
 
 async function main() {
@@ -196,9 +209,39 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
 
   // Read file content
   const content = await readFile(filePath, "utf8")
+  const targetHasConflicts = ConflictParser.hasConflicts(content)
+  let resolvedTarget = false
 
-  // Check if file has conflicts
-  if (!ConflictParser.hasConflicts(content)) {
+  if (targetHasConflicts) {
+    if (!options.quiet && !options.json) {
+      console.log(`🔧 Found Git conflict markers in ${filePath}, proceeding with resolution...`)
+    }
+
+    // Create resolver and resolve conflicts
+    const resolver = new PackageResolver(options)
+    const result = await resolver.resolveConflicts(content)
+
+    if (!result.resolved) {
+      console.error(`❌ Failed to resolve conflicts: ${result.errors.join(", ")}`)
+      process.exit(1)
+    }
+
+    if (result.packageJson) {
+      // Write resolved package.json (preserving original indentation/line endings)
+      await resolver.writeResolvedPackage(result.packageJson, filePath, content)
+      resolvedTarget = true
+    }
+  }
+
+  // When the target is a package.json, also resolve conflicted sibling
+  // lockfiles: Git conflicts often hit only the lockfile even when
+  // package.json merges cleanly.
+  let lockStatus: LockResolutionStatus = {resolved: 0, failed: 0, regenerated: new Set()}
+  if (basename(resolve(filePath)) === "package.json") {
+    lockStatus = await resolveCompanionLockfiles(filePath, options)
+  }
+
+  if (!targetHasConflicts && lockStatus.resolved === 0 && lockStatus.failed === 0) {
     if (!options.quiet) {
       if (options.json) {
         console.log(
@@ -221,65 +264,132 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     return
   }
 
-  if (!options.quiet && !options.json) {
-    console.log(`🔧 Found Git conflict markers, proceeding with resolution...`)
+  // Regenerate lockfiles so they are consistent with the merged package.json
+  if (
+    (resolvedTarget || lockStatus.resolved > 0 || lockStatus.failed > 0) &&
+    options.regenerateLock &&
+    !options.dryRun
+  ) {
+    await regenerateLockfiles(dirname(resolve(filePath)), options.quiet, lockStatus.regenerated)
   }
 
-  // Create resolver and resolve conflicts
-  const resolver = new PackageResolver(options)
-  const result = await resolver.resolveConflicts(content)
+  process.exit(lockStatus.failed > 0 ? 1 : 0)
+}
 
-  if (!result.resolved) {
-    console.error(`❌ Failed to resolve conflicts: ${result.errors.join(", ")}`)
-    process.exit(1)
-  }
-
-  if (result.packageJson) {
-    // Write resolved package.json (preserving original indentation/line endings)
-    await resolver.writeResolvedPackage(result.packageJson, filePath, content)
-
-    // Regenerate package-lock.json if requested
-    if (options.regenerateLock && !options.dryRun) {
-      await regeneratePackageLock(options.quiet)
-    }
-  }
-
-  process.exit(0)
+interface LockResolutionStatus {
+  resolved: number
+  failed: number
+  /** Package managers whose regeneration command already ran */
+  regenerated: Set<string>
 }
 
 /**
- * Regenerate package-lock.json using npm install
+ * Resolve conflicts in lockfiles that live next to the given package.json.
+ * JSON lockfiles (npm) are merged semantically; other package managers'
+ * lockfiles are delegated to the manager itself, which resolves conflicted
+ * lockfiles automatically.
  */
-async function regeneratePackageLock(quiet: boolean): Promise<void> {
-  if (!quiet) {
-    console.log("ℹ Regenerating package-lock.json...")
+async function resolveCompanionLockfiles(packageJsonPath: string, options: CliOptions): Promise<LockResolutionStatus> {
+  const dir = dirname(resolve(packageJsonPath))
+  const status: LockResolutionStatus = {resolved: 0, failed: 0, regenerated: new Set()}
+
+  for (const lockfile of LOCKFILES) {
+    const lockPath = join(dir, lockfile.name)
+
+    let lockContent: string
+    try {
+      lockContent = await readFile(lockPath, "utf8")
+    } catch {
+      continue // Lockfile doesn't exist
+    }
+
+    if (!ConflictParser.hasConflicts(lockContent)) {
+      continue
+    }
+
+    if (!options.quiet && !options.json) {
+      console.log(`🔧 Found Git conflict markers in ${lockfile.name}, resolving...`)
+    }
+
+    // npm lockfiles are JSON: merge them semantically
+    if (lockfile.jsonMergeable) {
+      const resolver = new PackageResolver({...options, file: lockPath})
+      const result = await resolver.resolveConflicts(lockContent)
+
+      if (result.resolved && result.packageJson) {
+        await resolver.writeResolvedPackage(result.packageJson, lockPath, lockContent)
+        status.resolved++
+      } else {
+        status.failed++
+        console.error(`❌ Could not auto-resolve ${lockfile.name}: ${result.errors.join(", ")}`)
+        console.error(`   Delete ${lockfile.name} and run "${lockfile.manualCommand}" to regenerate it.`)
+      }
+      continue
+    }
+
+    // yarn/pnpm/bun lockfiles: delegate to the package manager
+    if (options.dryRun) {
+      if (!options.quiet && !options.json) {
+        console.log(`ℹ Would resolve ${lockfile.name} by running "${lockfile.manualCommand}"`)
+      }
+      status.resolved++
+      continue
+    }
+
+    if (lockfile.safeRegenCommand && options.regenerateLock) {
+      const ran = await runLockfileCommand(lockfile.safeRegenCommand, dir, options.quiet)
+      const stillConflicted = ran ? ConflictParser.hasConflicts(await readFile(lockPath, "utf8")) : true
+
+      if (ran && !stillConflicted) {
+        status.resolved++
+        status.regenerated.add(lockfile.packageManager)
+        if (!options.quiet && !options.json) {
+          console.log(`✅ Resolved ${lockfile.name} via "${lockfile.manualCommand}"`)
+        }
+        continue
+      }
+    }
+
+    status.failed++
+    console.error(`❌ ${lockfile.name} has Git conflicts that this tool does not merge directly.`)
+    console.error(
+      `   Run "${lockfile.manualCommand}" — ${lockfile.packageManager} resolves conflicted lockfiles automatically.`
+    )
   }
 
-  try {
-    const npmProcess = spawnCommand("npm", ["install", "--package-lock-only"], {
-      stdio: quiet ? "pipe" : "inherit",
-    })
+  return status
+}
 
-    await new Promise<void>((resolve, reject) => {
-      npmProcess.on("close", code => {
-        if (code === 0) {
-          if (!quiet) {
-            console.log("✅ Successfully regenerated package-lock.json")
-          }
-          resolve()
-        } else {
-          reject(new Error(`npm install failed with exit code ${code}`))
-        }
-      })
+/**
+ * Regenerate existing lockfiles with their own package manager so they stay
+ * consistent with the merged package.json. Never creates a lockfile for a
+ * package manager the project doesn't use.
+ */
+async function regenerateLockfiles(dir: string, quiet: boolean, alreadyRegenerated: Set<string>): Promise<void> {
+  const lockfiles = await findLockfiles(dir)
+  if (lockfiles.length === 0) {
+    return // Lockless project: nothing to regenerate
+  }
 
-      npmProcess.on("error", reject)
-    })
-  } catch (error) {
-    if (!quiet) {
-      console.warn(
-        `⚠️ Failed to regenerate package-lock.json: ${error instanceof Error ? error.message : String(error)}`
-      )
-      console.log('ℹ You may need to run "npm install" manually')
+  const handled = new Set<string>(alreadyRegenerated)
+
+  for (const lockfile of lockfiles) {
+    if (handled.has(lockfile.packageManager)) continue
+    handled.add(lockfile.packageManager)
+
+    if (lockfile.safeRegenCommand) {
+      if (!quiet) {
+        console.log(`ℹ Regenerating ${lockfile.name} with ${lockfile.packageManager}...`)
+      }
+      const ok = await runLockfileCommand(lockfile.safeRegenCommand, dir, quiet)
+      if (ok) {
+        if (!quiet) console.log(`✅ Regenerated ${lockfile.name}`)
+      } else if (!quiet) {
+        console.warn(`⚠️ Failed to regenerate ${lockfile.name}`)
+        console.log(`ℹ You may need to run "${lockfile.manualCommand}" manually`)
+      }
+    } else if (!quiet) {
+      console.log(`ℹ Run "${lockfile.manualCommand}" to update ${lockfile.name} after this merge.`)
     }
   }
 }
