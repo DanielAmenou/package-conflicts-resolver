@@ -52,15 +52,19 @@ export const LOCKFILES: readonly LockfileInfo[] = [
     name: "yarn.lock",
     packageManager: "yarn",
     jsonMergeable: false,
-    // No lockfile-only mode that works across yarn classic and Berry, but
-    // both resolve conflicted yarn.lock files automatically during install.
+    // Yarn classic has no lockfile-only mode; Berry does (`--mode update-lockfile`).
+    // Both resolve conflicted yarn.lock files automatically during install, so
+    // the safe command is resolved per-project via resolveSafeRegenCommand().
     manualCommand: "yarn install",
   },
   {
     name: "bun.lock",
     packageManager: "bun",
     jsonMergeable: false,
-    manualCommand: "bun install",
+    // bun.lock (text lockfile) only exists on bun >= 1.2, which also supports
+    // --lockfile-only, so the safe command is always available for this file.
+    safeRegenCommand: {command: "bun", args: ["install", "--lockfile-only"]},
+    manualCommand: "bun install --lockfile-only",
   },
   {
     name: "bun.lockb",
@@ -86,6 +90,47 @@ export async function findLockfiles(dir: string): Promise<LockfileInfo[]> {
   }
 
   return found
+}
+
+/**
+ * Detect whether a project uses Yarn Berry (v2+): the "packageManager" field
+ * is the most explicit signal, then the presence of Berry's .yarnrc.yml.
+ * Yarn classic (v1) projects use .yarnrc (no extension) instead.
+ */
+export async function isYarnBerry(dir: string): Promise<boolean> {
+  try {
+    const packageJson = JSON.parse(await readFile(join(dir, "package.json"), "utf8"))
+    const field = typeof packageJson.packageManager === "string" ? packageJson.packageManager : ""
+    const match = field.match(/^yarn@(\d+)/)
+    if (match && match[1]) {
+      return parseInt(match[1], 10) >= 2
+    }
+  } catch {
+    // No package.json or invalid JSON: fall through to .yarnrc.yml detection
+  }
+
+  try {
+    await access(join(dir, ".yarnrc.yml"))
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve the command that safely updates a lockfile without installing
+ * node_modules, taking the project's setup into account. Yarn Berry supports
+ * `--mode update-lockfile`; Yarn classic has no equivalent, so it returns
+ * undefined and callers fall back to the manual command.
+ */
+export async function resolveSafeRegenCommand(
+  dir: string,
+  lockfile: LockfileInfo
+): Promise<{command: string; args: string[]} | undefined> {
+  if (lockfile.packageManager === "yarn") {
+    return (await isYarnBerry(dir)) ? {command: "yarn", args: ["install", "--mode", "update-lockfile"]} : undefined
+  }
+  return lockfile.safeRegenCommand
 }
 
 /**

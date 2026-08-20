@@ -40,13 +40,15 @@ export class VersionResolver {
     const ourClean = this.cleanVersion(ourVersion)
     const theirClean = this.cleanVersion(theirVersion)
 
-    // If versions are identical, return either one
-    if (ourClean === theirClean) {
+    // Only identical raw specs short-circuit: "^1.2.3" and "~1.2.3" share a
+    // base version but are different ranges and must go through resolution
+    if (ourVersion.trim() === theirVersion.trim()) {
       return {resolved: ourVersion, reason: "versions are identical"}
     }
 
-    // 1. Direct semver comparison (preserves pre-release)
-    if (semver.valid(ourClean) && semver.valid(theirClean)) {
+    // 1. Direct semver comparison, only when both specs are exact versions —
+    // comparing cleaned ranges here would erase range semantics ("^" vs "~")
+    if (semver.valid(ourVersion.trim()) && semver.valid(theirVersion.trim())) {
       // Check if one is a pre-release and the other is stable
       const ourIsPrerelease = semver.prerelease(ourClean) !== null
       const theirIsPrerelease = semver.prerelease(theirClean) !== null
@@ -122,13 +124,15 @@ export class VersionResolver {
     const ourClean = this.cleanVersion(ourVersion)
     const theirClean = this.cleanVersion(theirVersion)
 
-    // If versions are identical, return either one
-    if (ourClean === theirClean) {
+    // Only identical raw specs short-circuit: "^1.2.3" and "~1.2.3" share a
+    // base version but are different ranges and must go through resolution
+    if (ourVersion.trim() === theirVersion.trim()) {
       return {resolved: ourVersion, reason: "versions are identical"}
     }
 
-    // 1. Direct semver comparison (preserves pre-release)
-    if (semver.valid(ourClean) && semver.valid(theirClean)) {
+    // 1. Direct semver comparison, only when both specs are exact versions —
+    // comparing cleaned ranges here would erase range semantics ("^" vs "~")
+    if (semver.valid(ourVersion.trim()) && semver.valid(theirVersion.trim())) {
       const comparison = semver.compare(ourClean, theirClean)
       if (comparison < 0) {
         return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}

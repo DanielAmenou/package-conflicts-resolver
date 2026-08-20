@@ -8,7 +8,13 @@ import {spawn} from "node:child_process"
 import {access, mkdtemp, readFile, writeFile, rm} from "fs/promises"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
-import {detectPackageManager, findLockfiles} from "../package-manager.js"
+import {
+  detectPackageManager,
+  findLockfiles,
+  isYarnBerry,
+  resolveSafeRegenCommand,
+  LOCKFILES,
+} from "../package-manager.js"
 
 const CLI_PATH = join(__dirname, "..", "cli.js")
 
@@ -109,6 +115,84 @@ describe("Package manager detection", () => {
   })
 })
 
+function lockfileByName(name: string) {
+  const lockfile = LOCKFILES.find(entry => entry.name === name)
+  assert(lockfile, `unknown lockfile: ${name}`)
+  return lockfile
+}
+
+describe("Yarn Berry detection", () => {
+  test("detects Berry from the packageManager field", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), '{"packageManager": "yarn@4.5.0"}', "utf8")
+      assert.equal(await isYarnBerry(dir), true)
+    })
+  })
+
+  test("yarn classic in packageManager field is not Berry", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), '{"packageManager": "yarn@1.22.22"}', "utf8")
+      assert.equal(await isYarnBerry(dir), false)
+    })
+  })
+
+  test("detects Berry from .yarnrc.yml when packageManager is absent", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, ".yarnrc.yml"), "nodeLinker: node-modules\n", "utf8")
+      assert.equal(await isYarnBerry(dir), true)
+    })
+  })
+
+  test("defaults to false with no signals", async () => {
+    await withTempDir(async dir => {
+      assert.equal(await isYarnBerry(dir), false)
+    })
+  })
+})
+
+describe("Safe lockfile regeneration commands", () => {
+  test("npm lockfiles use --package-lock-only", async () => {
+    await withTempDir(async dir => {
+      const cmd = await resolveSafeRegenCommand(dir, lockfileByName("package-lock.json"))
+      assert.deepEqual(cmd, {command: "npm", args: ["install", "--package-lock-only"]})
+    })
+  })
+
+  test("pnpm uses --lockfile-only", async () => {
+    await withTempDir(async dir => {
+      const cmd = await resolveSafeRegenCommand(dir, lockfileByName("pnpm-lock.yaml"))
+      assert.deepEqual(cmd, {command: "pnpm", args: ["install", "--lockfile-only"]})
+    })
+  })
+
+  test("bun.lock uses --lockfile-only", async () => {
+    await withTempDir(async dir => {
+      const cmd = await resolveSafeRegenCommand(dir, lockfileByName("bun.lock"))
+      assert.deepEqual(cmd, {command: "bun", args: ["install", "--lockfile-only"]})
+    })
+  })
+
+  test("binary bun.lockb has no safe command", async () => {
+    await withTempDir(async dir => {
+      assert.equal(await resolveSafeRegenCommand(dir, lockfileByName("bun.lockb")), undefined)
+    })
+  })
+
+  test("yarn classic has no safe command", async () => {
+    await withTempDir(async dir => {
+      assert.equal(await resolveSafeRegenCommand(dir, lockfileByName("yarn.lock")), undefined)
+    })
+  })
+
+  test("Yarn Berry gets --mode update-lockfile", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), '{"packageManager": "yarn@4.5.0"}', "utf8")
+      const cmd = await resolveSafeRegenCommand(dir, lockfileByName("yarn.lock"))
+      assert.deepEqual(cmd, {command: "yarn", args: ["install", "--mode", "update-lockfile"]})
+    })
+  })
+})
+
 describe("CLI multi-package-manager behavior", () => {
   test("never creates a package-lock.json in a yarn project", async () => {
     await withTempDir(async dir => {
@@ -170,6 +254,30 @@ describe("CLI multi-package-manager behavior", () => {
       assert.equal(result.code, 0, result.stderr)
       assert(result.stdout.includes("Would resolve yarn.lock"))
       assert.equal(await readFile(join(dir, "yarn.lock"), "utf8"), CONFLICTED_YARN_LOCK)
+    })
+  })
+
+  test("conflicted bun.lock reports the bun command when regeneration is disabled", async () => {
+    await withTempDir(async dir => {
+      const conflictedBunLock = [
+        "{",
+        '  "lockfileVersion": 1,',
+        "<<<<<<< HEAD",
+        '  "workspaces": {"": {"dependencies": {"lodash": "^4.17.21"}}}',
+        "=======",
+        '  "workspaces": {"": {"dependencies": {"lodash": "^4.17.20"}}}',
+        ">>>>>>> feature",
+        "}",
+        "",
+      ].join("\n")
+
+      await writeFile(join(dir, "package.json"), '{\n  "name": "app"\n}\n', "utf8")
+      await writeFile(join(dir, "bun.lock"), conflictedBunLock, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      assert(result.stderr.includes("bun install --lockfile-only"))
+      assert.equal(await readFile(join(dir, "bun.lock"), "utf8"), conflictedBunLock)
     })
   })
 

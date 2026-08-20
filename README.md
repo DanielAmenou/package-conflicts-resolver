@@ -9,7 +9,7 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 - **Git integration** as merge driver or in hooks
 - **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers (diff3 base sections enable true 3-way merges)
 - **Lockfile-safe merging** - `version`, `resolved`, and `integrity` of a package-lock entry are always kept together
-- **npm, yarn, pnpm, and bun aware** - npm lockfiles are merged directly; conflicted `yarn.lock` / `pnpm-lock.yaml` / `bun.lock` files are delegated to their package manager (which resolves them automatically), and the tool never creates a lockfile for a package manager your project doesn't use
+- **npm, yarn, pnpm, and bun aware** - npm lockfiles are merged directly; conflicted `yarn.lock` / `pnpm-lock.yaml` / `bun.lock` files are fixed by their own package manager without installing `node_modules` (see the table below), and the tool never creates a lockfile for a package manager your project doesn't use
 - **Stable JSON formatting** - preserves field order, indentation (tabs/spaces), and line endings (LF/CRLF)
 - **Cross-platform** - works on Linux, macOS, and Windows
 
@@ -60,11 +60,16 @@ npx package-conflicts-resolver --strategy lowest
 
 When the target is a `package.json`, conflicted sibling lockfiles are detected and handled in the same run — even if `package.json` itself merged cleanly:
 
-- `package-lock.json` / `npm-shrinkwrap.json` are merged semantically, then regenerated with `npm install --package-lock-only`
-- `pnpm-lock.yaml` is fixed by running `pnpm install --lockfile-only` (pnpm resolves conflicted lockfiles automatically)
-- `yarn.lock` and `bun.lock` are left to their package manager: the tool prints the exact command (`yarn install` / `bun install`), since both resolve conflicted lockfiles automatically during install
+| Package manager | Lockfile                                   | Conflict handling                                                                                    |
+| --------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| npm             | `package-lock.json`, `npm-shrinkwrap.json` | Merged semantically by this tool, then regenerated with `npm install --package-lock-only`            |
+| pnpm            | `pnpm-lock.yaml`                           | `pnpm install --lockfile-only` (pnpm resolves conflicted lockfiles automatically)                    |
+| Yarn Berry (2+) | `yarn.lock`                                | `yarn install --mode update-lockfile` (detected via the `packageManager` field or `.yarnrc.yml`)     |
+| Yarn classic    | `yarn.lock`                                | Prints `yarn install` (classic has no lockfile-only mode but auto-resolves conflicts during install) |
+| bun             | `bun.lock`                                 | `bun install --lockfile-only`                                                                        |
+| bun             | `bun.lockb` (binary)                       | Prints `bun install`                                                                                 |
 
-Regeneration only runs for lockfiles that already exist in your project, and can be skipped with `--no-regenerate-lock`.
+Regeneration only runs for lockfiles that already exist in your project, never installs `node_modules`, and can be skipped with `--no-regenerate-lock`.
 
 ### Resolution Strategies
 
@@ -117,6 +122,7 @@ If you prefer to set up manually, add these lines to your `.gitattributes`:
 ```
 package.json merge=package-conflicts-resolver
 package-lock.json merge=package-conflicts-resolver
+npm-shrinkwrap.json merge=package-conflicts-resolver
 ```
 
 And configure the merge driver:
@@ -163,6 +169,7 @@ If you prefer to remove manually:
    ```
    package.json merge=package-conflicts-resolver
    package-lock.json merge=package-conflicts-resolver
+   npm-shrinkwrap.json merge=package-conflicts-resolver
    ```
 
 ### In Git Hooks
@@ -274,6 +281,7 @@ if (result.resolved && result.packageJson) {
    ```
    package.json merge=package-conflicts-resolver
    package-lock.json merge=package-conflicts-resolver
+   npm-shrinkwrap.json merge=package-conflicts-resolver
    ```
 
 4. **Re-run setup**:

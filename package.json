@@ -17,6 +17,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "test": "node --test \"dist/test/**/*.test.js\"",
+    "test:coverage": "node --test --experimental-test-coverage \"dist/test/**/*.test.js\"",
     "test:watch": "node --test --watch \"dist/test/**/*.test.js\"",
     "lint": "tsc --noEmit",
     "format": "prettier --write .",

@@ -108,6 +108,115 @@ describe("VersionResolver", () => {
     })
   })
 
+  describe("lowest strategy branches", () => {
+    test("prefers the lower pre-release over stable", () => {
+      const result = VersionResolver.resolveVersion("1.0.0-alpha.1", "1.0.0", "lowest")
+      assert.equal(result.resolved, "1.0.0-alpha.1")
+    })
+
+    test("identical specs short-circuit", () => {
+      const result = VersionResolver.resolveVersion("^1.2.3", "^1.2.3", "lowest")
+      assert.equal(result.resolved, "^1.2.3")
+      assert(result.reason.includes("identical"))
+    })
+
+    test("compares ranges by minimum version", () => {
+      assert.equal(VersionResolver.resolveVersion("^1.5.0", "^1.2.0", "lowest").resolved, "^1.2.0")
+      assert.equal(VersionResolver.resolveVersion("^1.2.0", "^1.5.0", "lowest").resolved, "^1.2.0")
+    })
+
+    test("equal minimums prefer the more restrictive range", () => {
+      assert.equal(VersionResolver.resolveVersion("^1.2.3", "~1.2.3", "lowest").resolved, "~1.2.3")
+      assert.equal(VersionResolver.resolveVersion("~1.2.3", "^1.2.3", "lowest").resolved, "~1.2.3")
+      assert.equal(VersionResolver.resolveVersion("^1.2.3", "1.2.3", "lowest").resolved, "1.2.3", "exact wins")
+    })
+
+    test("falls back to coerced comparison for near-semver strings", () => {
+      assert.equal(VersionResolver.resolveVersion("v1.2", "1.3.0.0", "lowest").resolved, "v1.2")
+      assert.equal(VersionResolver.resolveVersion("1.3.0.0", "v1.2", "lowest").resolved, "v1.2")
+    })
+
+    test("keeps ours for non-comparable specs", () => {
+      const result = VersionResolver.resolveVersion("workspace:*", "file:../lib", "lowest")
+      assert.equal(result.resolved, "workspace:*")
+      assert(result.reason.includes("not comparable"))
+    })
+  })
+
+  describe("highest strategy branches", () => {
+    test("equal range minimums prefer the more specific spec", () => {
+      assert.equal(VersionResolver.resolveVersion("1.2.3", "^1.2.3", "highest").resolved, "1.2.3")
+      assert.equal(VersionResolver.resolveVersion("^1.2.3", "1.2.3", "highest").resolved, "1.2.3")
+      assert.equal(VersionResolver.resolveVersion("~1.2.3", "^1.2.3", "highest").resolved, "~1.2.3")
+    })
+
+    test("falls back to coerced comparison for near-semver strings", () => {
+      assert.equal(VersionResolver.resolveVersion("v1.2", "1.3.0.0", "highest").resolved, "1.3.0.0")
+      assert.equal(VersionResolver.resolveVersion("1.3.0.0", "v1.2", "highest").resolved, "1.3.0.0")
+    })
+
+    test("wildcard and x-ranges compare by minimum", () => {
+      const result = VersionResolver.resolveVersion("1.x", "2.x", "highest")
+      assert.equal(result.resolved, "2.x")
+    })
+
+    test("keeps ours for non-comparable specs", () => {
+      const result = VersionResolver.resolveVersion("workspace:*", "npm:lodash@4", "highest")
+      assert.equal(result.resolved, "workspace:*")
+      assert(result.reason.includes("not comparable"))
+    })
+
+    test("prerelease-only comparison keeps semver ordering", () => {
+      assert.equal(VersionResolver.resolveVersion("2.0.0-rc.2", "2.0.0-rc.1", "highest").resolved, "2.0.0-rc.2")
+    })
+
+    test("our stable version beats their pre-release", () => {
+      const result = VersionResolver.resolveVersion("1.0.0", "1.0.1-beta.1", "highest")
+      assert.equal(result.resolved, "1.0.0")
+      assert(result.reason.includes("stable"))
+    })
+
+    test("identical raw specs short-circuit", () => {
+      const result = VersionResolver.resolveVersion("^1.2.3", "^1.2.3", "highest")
+      assert.equal(result.resolved, "^1.2.3")
+      assert(result.reason.includes("identical"))
+    })
+
+    test("range vs non-comparable spec keeps ours", () => {
+      const result = VersionResolver.resolveVersion("^1.0.0", "workspace:*", "highest")
+      assert.equal(result.resolved, "^1.0.0")
+    })
+  })
+
+  describe("resolveNonVersion branches", () => {
+    test("numbers compare numerically", () => {
+      assert.equal(VersionResolver.resolveNonVersion(2, 3, "highest").resolved, 3)
+      assert.equal(VersionResolver.resolveNonVersion(2, 3, "lowest").resolved, 2)
+      assert.equal(VersionResolver.resolveNonVersion(3, 2, "highest").resolved, 3)
+    })
+
+    test("theirs strategy returns their value", () => {
+      assert.equal(VersionResolver.resolveNonVersion("a", "b", "theirs").resolved, "b")
+    })
+
+    test("mixed types keep our value", () => {
+      const result = VersionResolver.resolveNonVersion("text", 42, "highest")
+      assert.equal(result.resolved, "text")
+      assert(result.reason.includes("keeping our value"))
+    })
+
+    test("objects keep our value under highest/lowest", () => {
+      const ours = {a: 1}
+      assert.equal(VersionResolver.resolveNonVersion(ours, {b: 2}, "highest").resolved, ours)
+      assert.equal(VersionResolver.resolveNonVersion(ours, {b: 2}, "lowest").resolved, ours)
+    })
+
+    test("unknown strategy keeps our value", () => {
+      const result = VersionResolver.resolveNonVersion("a", "b", "bogus" as any)
+      assert.equal(result.resolved, "a")
+    })
+  })
+
   describe("edge cases", () => {
     test("should handle empty strings", () => {
       const result = VersionResolver.resolveVersion("", "1.0.0", "highest")

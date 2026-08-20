@@ -86,7 +86,7 @@ export class PackageResolver {
         const resolvedContent = ConflictParser.removeConflictMarkers(content, resolvedSections)
 
         try {
-          const parsedJson = JSON.parse(resolvedContent)
+          const parsedJson = this.parseResolvedJson(resolvedContent)
           result.packageJson = parsedJson
           result.resolved = true
 
@@ -216,7 +216,16 @@ export class PackageResolver {
       if (this.isDependencyField(fieldName) || fieldName === "scripts") {
         const ourData = ConflictParser.parsePartialJson(conflict.ours)
         const theirData = ConflictParser.parsePartialJson(conflict.theirs)
-        return this.resolveDependencyConflict(fieldName, ourData, theirData)
+        const resolved = this.resolveDependencyConflict(fieldName, ourData, theirData)
+
+        // Keep the raw conflict content so formatting can tell whether the
+        // conflict covered the whole field or only entries inside it
+        if (resolved) {
+          resolved.originalOurs = conflict.ours
+          resolved.originalTheirs = conflict.theirs
+        }
+
+        return resolved
       } else if (fieldName.startsWith("node_modules/")) {
         // For package-lock.json node_modules entries, parse as objects and resolve fields
         const ourData = ConflictParser.parsePartialJson(conflict.ours)
@@ -259,7 +268,7 @@ export class PackageResolver {
     let theirDeps: Record<string, string> = {}
 
     // If the data is already an object with the field name, extract it
-    if (this.isPlainObject(ourData) && ourData[fieldName]) {
+    if (this.isPlainObject(ourData) && this.isPlainObject(ourData[fieldName])) {
       ourDeps = ourData[fieldName]
     } else if (this.isPlainObject(ourData)) {
       // If it's a direct dependency object
@@ -271,7 +280,7 @@ export class PackageResolver {
       return this.resolveSimpleConflict(fieldName, ourValue, theirValue)
     }
 
-    if (this.isPlainObject(theirData) && theirData[fieldName]) {
+    if (this.isPlainObject(theirData) && this.isPlainObject(theirData[fieldName])) {
       theirDeps = theirData[fieldName]
     } else if (this.isPlainObject(theirData)) {
       theirDeps = theirData
@@ -462,13 +471,24 @@ export class PackageResolver {
     }
 
     if (this.isDependencyField(resolved.field) || resolved.field === "scripts") {
-      // For dependency conflicts, format as the complete field with its content
+      // The conflict may cover the whole field (declaration line included) or
+      // only entries inside it. Re-emitting the declaration in the latter case
+      // would nest the field inside itself, so only wrap when the original
+      // conflict content actually declared the field.
+      const escapedField = resolved.field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      const declarationPattern = new RegExp(`"${escapedField}"\\s*:`)
+      const conflictDeclaresField =
+        (resolved.originalOurs !== undefined && declarationPattern.test(resolved.originalOurs)) ||
+        (resolved.originalTheirs !== undefined && declarationPattern.test(resolved.originalTheirs)) ||
+        (resolved.originalOurs === undefined && resolved.originalTheirs === undefined)
+
       try {
         const resolvedDeps = JSON.parse(resolved.resolvedValue)
         const lines = []
 
-        // Add the field name
-        lines.push(`  "${resolved.field}": {`)
+        if (conflictDeclaresField) {
+          lines.push(`  "${resolved.field}": {`)
+        }
 
         // Add each dependency/script
         const entries = Object.entries(resolvedDeps)
@@ -482,7 +502,20 @@ export class PackageResolver {
           }
         }
 
-        lines.push("  }")
+        if (conflictDeclaresField) {
+          lines.push("  }")
+        } else {
+          // Entries-only conflicts must preserve a trailing comma when either
+          // side had one, since more entries follow in the surrounding JSON
+          const originalHadTrailingComma =
+            (resolved.originalOurs && resolved.originalOurs.trim().endsWith(",")) ||
+            (resolved.originalTheirs && resolved.originalTheirs.trim().endsWith(","))
+          const lastLine = lines[lines.length - 1]
+          if (originalHadTrailingComma && lastLine) {
+            lines[lines.length - 1] = `${lastLine},`
+          }
+        }
+
         return lines.join("\n")
       } catch (error) {
         // Fallback to simple formatting
@@ -531,6 +564,28 @@ export class PackageResolver {
 
       const comma = originalHadTrailingComma ? "," : ""
       return `  "${resolved.field}": ${value}${comma}`
+    }
+  }
+
+  /**
+   * Parse fallback-resolved content. Block-based resolution can leave a
+   * trailing comma before a closing brace (a common merge artifact when the
+   * conflicted side ended with one), so retry with trailing commas stripped
+   * before giving up.
+   */
+  private parseResolvedJson(content: string): any {
+    try {
+      return JSON.parse(content)
+    } catch (error) {
+      const repaired = content.replace(/,(\s*[}\]])/g, "$1")
+      if (repaired !== content) {
+        try {
+          return JSON.parse(repaired)
+        } catch {
+          // Fall through to the original, more useful error
+        }
+      }
+      throw error
     }
   }
 

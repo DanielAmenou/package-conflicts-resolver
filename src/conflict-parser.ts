@@ -285,10 +285,16 @@ export class ConflictParser {
       for (const line of lines) {
         const match = line.match(/^\s*"([^"]+)"\s*:\s*(.+?),?\s*$/)
         if (match && match[1] && match[2]) {
+          const rawValue = match[2].replace(/,$/, "").trim()
+          // Skip structural opener lines like `"dependencies": {` — they are
+          // field declarations, not key-value entries
+          if (rawValue === "{" || rawValue === "[") {
+            continue
+          }
           try {
-            result[match[1]] = JSON.parse(match[2].replace(/,$/, ""))
+            result[match[1]] = JSON.parse(rawValue)
           } catch {
-            result[match[1]] = match[2].replace(/[",]/g, "").trim()
+            result[match[1]] = rawValue.replace(/[",]/g, "").trim()
           }
         }
       }

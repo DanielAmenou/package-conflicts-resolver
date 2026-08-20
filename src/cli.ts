@@ -11,10 +11,21 @@ import {basename, dirname, join, resolve} from "node:path"
 import {readFile, access} from "fs/promises"
 import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
-import {LOCKFILES, findLockfiles} from "./package-manager.js"
+import {LOCKFILES, findLockfiles, resolveSafeRegenCommand} from "./package-manager.js"
 import {RESOLUTION_STRATEGIES, CliOptions} from "./types.js"
 
 const IS_WINDOWS = process.platform === "win32"
+
+/**
+ * .gitattributes entries managed by setup/verify/uninstall. Only JSON files
+ * the merge driver can actually merge are routed to it; yarn/pnpm/bun
+ * lockfiles are resolved by their own package manager during install.
+ */
+const GITATTRIBUTES_ENTRIES = [
+  "package.json merge=package-conflicts-resolver",
+  "package-lock.json merge=package-conflicts-resolver",
+  "npm-shrinkwrap.json merge=package-conflicts-resolver",
+]
 
 /**
  * Read the tool version from its own package.json (single source of truth)
@@ -35,6 +46,13 @@ function getToolVersion(): string {
 function spawnCommand(command: string, args: string[], options: Parameters<typeof spawn>[2] = {}) {
   const needsShell = IS_WINDOWS && ["npm", "npx", "yarn", "pnpm", "bun"].includes(command)
   return spawn(command, args, {...options, shell: needsShell})
+}
+
+/**
+ * Render a spawnable command as the string a user would type
+ */
+function formatCommand(cmd: {command: string; args: string[]}): string {
+  return [cmd.command, ...cmd.args].join(" ")
 }
 
 /**
@@ -336,15 +354,16 @@ async function resolveCompanionLockfiles(packageJsonPath: string, options: CliOp
       continue
     }
 
-    if (lockfile.safeRegenCommand && options.regenerateLock) {
-      const ran = await runLockfileCommand(lockfile.safeRegenCommand, dir, options.quiet)
+    const safeRegenCommand = await resolveSafeRegenCommand(dir, lockfile)
+    if (safeRegenCommand && options.regenerateLock) {
+      const ran = await runLockfileCommand(safeRegenCommand, dir, options.quiet)
       const stillConflicted = ran ? ConflictParser.hasConflicts(await readFile(lockPath, "utf8")) : true
 
       if (ran && !stillConflicted) {
         status.resolved++
         status.regenerated.add(lockfile.packageManager)
         if (!options.quiet && !options.json) {
-          console.log(`✅ Resolved ${lockfile.name} via "${lockfile.manualCommand}"`)
+          console.log(`✅ Resolved ${lockfile.name} via "${formatCommand(safeRegenCommand)}"`)
         }
         continue
       }
@@ -355,6 +374,7 @@ async function resolveCompanionLockfiles(packageJsonPath: string, options: CliOp
     console.error(
       `   Run "${lockfile.manualCommand}" — ${lockfile.packageManager} resolves conflicted lockfiles automatically.`
     )
+    console.error(`   If that fails, delete ${lockfile.name} and run "${lockfile.manualCommand}" to recreate it.`)
   }
 
   return status
@@ -377,11 +397,12 @@ async function regenerateLockfiles(dir: string, quiet: boolean, alreadyRegenerat
     if (handled.has(lockfile.packageManager)) continue
     handled.add(lockfile.packageManager)
 
-    if (lockfile.safeRegenCommand) {
+    const safeRegenCommand = await resolveSafeRegenCommand(dir, lockfile)
+    if (safeRegenCommand) {
       if (!quiet) {
         console.log(`ℹ Regenerating ${lockfile.name} with ${lockfile.packageManager}...`)
       }
-      const ok = await runLockfileCommand(lockfile.safeRegenCommand, dir, quiet)
+      const ok = await runLockfileCommand(safeRegenCommand, dir, quiet)
       if (ok) {
         if (!quiet) console.log(`✅ Regenerated ${lockfile.name}`)
       } else if (!quiet) {
@@ -448,8 +469,9 @@ async function setupGitIntegration(global: boolean, skipGitattributes: boolean =
     } else if (global) {
       console.log(`\n⚠️  Global setup complete, but you still need to add .gitattributes to each repository:`)
       console.log(`\nAdd this to your .gitattributes file in each project:`)
-      console.log(`  package.json merge=package-conflicts-resolver`)
-      console.log(`  package-lock.json merge=package-conflicts-resolver`)
+      for (const entry of GITATTRIBUTES_ENTRIES) {
+        console.log(`  ${entry}`)
+      }
       console.log(`\nOr run 'package-conflicts-resolver setup' (without --global) in each repository.`)
     }
 
@@ -465,10 +487,7 @@ async function setupGitIntegration(global: boolean, skipGitattributes: boolean =
 async function setupGitattributes(): Promise<void> {
   try {
     const gitattributesPath = ".gitattributes"
-    const requiredLines = [
-      "package.json merge=package-conflicts-resolver",
-      "package-lock.json merge=package-conflicts-resolver",
-    ]
+    const requiredLines = GITATTRIBUTES_ENTRIES
 
     let content = ""
     let fileExists = false
@@ -510,8 +529,9 @@ async function setupGitattributes(): Promise<void> {
       `⚠️  Could not setup .gitattributes automatically: ${error instanceof Error ? error.message : String(error)}`
     )
     console.log(`\nPlease manually add these lines to your .gitattributes file:`)
-    console.log(`  package.json merge=package-conflicts-resolver`)
-    console.log(`  package-lock.json merge=package-conflicts-resolver`)
+    for (const entry of GITATTRIBUTES_ENTRIES) {
+      console.log(`  ${entry}`)
+    }
   }
 }
 
@@ -598,11 +618,18 @@ async function verifySetup(): Promise<void> {
     const content = await readFile(".gitattributes", "utf8")
     const lines = content.split("\n")
 
-    const hasPackageJson = lines.some(line => line.trim() === "package.json merge=package-conflicts-resolver")
-    const hasPackageLock = lines.some(line => line.trim() === "package-lock.json merge=package-conflicts-resolver")
+    const hasEntry = (entry: string) => lines.some(line => line.trim() === entry)
+    const hasPackageJson = hasEntry("package.json merge=package-conflicts-resolver")
+    const hasPackageLock = hasEntry("package-lock.json merge=package-conflicts-resolver")
+    const hasShrinkwrap = hasEntry("npm-shrinkwrap.json merge=package-conflicts-resolver")
 
     if (hasPackageJson && hasPackageLock) {
       console.log("✅ .gitattributes is configured correctly")
+      if (!hasShrinkwrap) {
+        // Older setups didn't add the shrinkwrap entry; suggest, don't fail
+        console.log("   ℹ️  Optional: add 'npm-shrinkwrap.json merge=package-conflicts-resolver'")
+        console.log("      (re-running 'package-conflicts-resolver setup' adds it)")
+      }
     } else {
       console.log("⚠️  .gitattributes is incomplete:")
       if (!hasPackageJson) console.log("   Missing: package.json merge=package-conflicts-resolver")
@@ -805,10 +832,7 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
  */
 async function cleanupGitattributes(): Promise<void> {
   const gitattributesPath = ".gitattributes"
-  const entriesToRemove = [
-    "package.json merge=package-conflicts-resolver",
-    "package-lock.json merge=package-conflicts-resolver",
-  ]
+  const entriesToRemove = GITATTRIBUTES_ENTRIES
 
   try {
     const content = await readFile(gitattributesPath, "utf8")
