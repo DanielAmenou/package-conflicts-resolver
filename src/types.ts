@@ -41,6 +41,30 @@ export interface ResolvedConflict {
   strategy: string
   originalOurs?: string
   originalTheirs?: string
+  /**
+   * When true, `resolvedValue` is one side of the conflict taken verbatim and
+   * must be inserted as-is instead of being re-formatted as a JSON property.
+   */
+  verbatim?: boolean
+}
+
+/**
+ * A dependency edge in an npm lockfile whose locked version does not satisfy
+ * the declared spec. `npm ci` refuses to install from such a lockfile.
+ */
+export interface LockfileIssue {
+  /** Location of the dependent entry inside "packages" ("" is the root project) */
+  from: string
+  /** Dependency name as declared by the dependent */
+  name: string
+  /** Declared version spec (range) */
+  spec: string
+  /** Location of the entry the dependency resolves to, when one was found */
+  resolvedPath?: string
+  /** Version locked at `resolvedPath`, when one was found */
+  version?: string
+  kind: "missing" | "invalid"
+  message: string
 }
 
 export interface ResolutionResult {
@@ -48,6 +72,13 @@ export interface ResolutionResult {
   conflicts: ResolvedConflict[]
   packageJson?: PackageJson
   errors: string[]
+  /**
+   * Only set when the merged document is an npm lockfile: dependency edges that
+   * the merged lockfile no longer satisfies. Empty means the lockfile is
+   * self-consistent; a non-empty list means it must be regenerated with
+   * `npm install --package-lock-only` before `npm ci` will accept it.
+   */
+  lockfileIssues?: LockfileIssue[]
 }
 
 export interface LoggerOptions {
@@ -64,6 +95,11 @@ export interface CliOptions {
   verbose: boolean
   regenerateLock: boolean
   file?: string
+  /**
+   * Merge driver only: accept a merged package-lock.json whose dependency
+   * graph is inconsistent instead of leaving the file conflicted for npm.
+   */
+  allowInconsistentLockfile?: boolean
 }
 
 export const RESOLUTION_STRATEGIES: Record<ResolutionStrategy["name"], ResolutionStrategy> = {

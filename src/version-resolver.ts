@@ -49,38 +49,23 @@ export class VersionResolver {
     // 1. Direct semver comparison, only when both specs are exact versions —
     // comparing cleaned ranges here would erase range semantics ("^" vs "~")
     if (semver.valid(ourVersion.trim()) && semver.valid(theirVersion.trim())) {
-      // Check if one is a pre-release and the other is stable
-      const ourIsPrerelease = semver.prerelease(ourClean) !== null
-      const theirIsPrerelease = semver.prerelease(theirClean) !== null
-
-      // Prefer stable versions over pre-release versions when using "highest" strategy
-      if (ourIsPrerelease && !theirIsPrerelease) {
-        return {
-          resolved: theirVersion,
-          reason: `their version ${theirClean} is stable, preferring over pre-release ${ourClean}`,
-        }
-      }
-      if (!ourIsPrerelease && theirIsPrerelease) {
-        return {
-          resolved: ourVersion,
-          reason: `our version ${ourClean} is stable, preferring over pre-release ${theirClean}`,
-        }
-      }
-
-      // Both are either stable or pre-release, use normal semver comparison
-      const comparison = semver.compare(ourClean, theirClean)
+      const comparison = this.compareForHighest(ourClean, theirClean)
       if (comparison > 0) {
-        return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
+        return {resolved: ourVersion, reason: this.describeHigher(ourClean, theirClean, "our", "their")}
       } else if (comparison < 0) {
-        return {resolved: theirVersion, reason: `their version ${theirClean} is higher than ${ourClean}`}
+        return {resolved: theirVersion, reason: this.describeHigher(theirClean, ourClean, "their", "our")}
       } else {
         return {resolved: ourVersion, reason: "versions are identical"}
       }
     }
 
     // 2. Compare as semver ranges (handles "*", "1.x", ">=1.0.0 <2.0.0", "1.2.3 - 2.0.0", ...)
-    const rangeComparison = this.compareAsRanges(ourVersion, theirVersion)
-    if (rangeComparison !== null) {
+    // by their minimum satisfying versions, with the same stable-over-pre-release
+    // rule as exact versions so a package.json range and the exact version locked
+    // for it in package-lock.json always resolve to the same side.
+    const minimums = this.rangeMinimums(ourVersion, theirVersion)
+    if (minimums !== null) {
+      const rangeComparison = this.compareForHighest(minimums.ours, minimums.theirs)
       if (rangeComparison > 0) {
         return {resolved: ourVersion, reason: `our range ${ourVersion} allows a higher minimum than ${theirVersion}`}
       } else if (rangeComparison < 0) {
@@ -144,8 +129,9 @@ export class VersionResolver {
     }
 
     // 2. Compare as semver ranges
-    const rangeComparison = this.compareAsRanges(ourVersion, theirVersion)
-    if (rangeComparison !== null) {
+    const minimums = this.rangeMinimums(ourVersion, theirVersion)
+    if (minimums !== null) {
+      const rangeComparison = semver.compare(minimums.ours, minimums.theirs)
       if (rangeComparison < 0) {
         return {resolved: ourVersion, reason: `our range ${ourVersion} allows a lower minimum than ${theirVersion}`}
       } else if (rangeComparison > 0) {
@@ -179,10 +165,35 @@ export class VersionResolver {
   }
 
   /**
-   * Compare two specs as semver ranges using their minimum satisfying versions.
+   * Order two exact versions for the "highest" strategy: a stable release beats
+   * a pre-release even when the pre-release has a higher base version
+   * (2.68.6 beats 2.68.4-beta.3); otherwise semver precedence decides.
+   * Returns > 0 when `a` wins, < 0 when `b` wins, 0 when they are equal.
+   */
+  private static compareForHighest(a: string | semver.SemVer, b: string | semver.SemVer): number {
+    const aIsPrerelease = semver.prerelease(a) !== null
+    const bIsPrerelease = semver.prerelease(b) !== null
+    if (aIsPrerelease !== bIsPrerelease) {
+      return aIsPrerelease ? -1 : 1
+    }
+    return semver.compare(a, b)
+  }
+
+  private static describeHigher(winner: string, loser: string, winnerSide: string, loserSide: string): string {
+    if (semver.prerelease(loser) !== null && semver.prerelease(winner) === null) {
+      return `${winnerSide} version ${winner} is stable, preferring over pre-release ${loser}`
+    }
+    return `${winnerSide} version ${winner} is higher than ${loser}`
+  }
+
+  /**
+   * Minimum satisfying versions of two specs interpreted as semver ranges.
    * Returns null when either side is not a valid range.
    */
-  private static compareAsRanges(ourVersion: string, theirVersion: string): number | null {
+  private static rangeMinimums(
+    ourVersion: string,
+    theirVersion: string
+  ): {ours: semver.SemVer; theirs: semver.SemVer} | null {
     try {
       const ourRange = semver.validRange(ourVersion.trim(), {loose: true})
       const theirRange = semver.validRange(theirVersion.trim(), {loose: true})
@@ -190,13 +201,13 @@ export class VersionResolver {
         return null
       }
 
-      const ourMin = semver.minVersion(ourRange)
-      const theirMin = semver.minVersion(theirRange)
-      if (!ourMin || !theirMin) {
+      const ours = semver.minVersion(ourRange)
+      const theirs = semver.minVersion(theirRange)
+      if (!ours || !theirs) {
         return null
       }
 
-      return semver.compare(ourMin, theirMin)
+      return {ours, theirs}
     } catch {
       return null
     }

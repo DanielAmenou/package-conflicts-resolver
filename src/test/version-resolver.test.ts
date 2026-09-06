@@ -235,3 +235,27 @@ describe("VersionResolver", () => {
     })
   })
 })
+
+describe("stable-over-pre-release applies to ranges too", () => {
+  test("a stable range beats a pre-release range with a higher base version", () => {
+    assert.equal(VersionResolver.resolveVersion("^2.0.0-beta.1", "^1.9.0", "highest").resolved, "^1.9.0")
+    assert.equal(VersionResolver.resolveVersion("^1.9.0", "^2.0.0-beta.1", "highest").resolved, "^1.9.0")
+  })
+
+  test("an exact pre-release spec loses to a stable range", () => {
+    // Mirrors what happens in package.json ("2.0.0-beta.1" vs "^1.9.0") and in
+    // the lockfile ("2.0.0-beta.1" vs "1.9.0"): both must pick the stable side
+    assert.equal(VersionResolver.resolveVersion("2.0.0-beta.1", "^1.9.0", "highest").resolved, "^1.9.0")
+    assert.equal(VersionResolver.resolveVersion("2.0.0-beta.1", "1.9.0", "highest").resolved, "1.9.0")
+  })
+
+  test("two pre-release ranges compare by semver precedence", () => {
+    assert.equal(VersionResolver.resolveVersion("^2.0.0-beta.1", "^2.0.0-beta.3", "highest").resolved, "^2.0.0-beta.3")
+    assert.equal(VersionResolver.resolveVersion("^2.0.0-rc.1", "^2.0.0-beta.9", "highest").resolved, "^2.0.0-rc.1")
+  })
+
+  test("the lowest strategy keeps plain semver ordering for pre-release ranges", () => {
+    assert.equal(VersionResolver.resolveVersion("^2.0.0-beta.1", "^1.9.0", "lowest").resolved, "^1.9.0")
+    assert.equal(VersionResolver.resolveVersion("^1.0.0-alpha.1", "^1.0.0", "lowest").resolved, "^1.0.0-alpha.1")
+  })
+})

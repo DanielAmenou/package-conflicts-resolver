@@ -6,12 +6,36 @@ import {isDeepStrictEqual} from "node:util"
 import {ConflictParser} from "./conflict-parser.js"
 import {VersionResolver} from "./version-resolver.js"
 import {Logger} from "./logger.js"
-import {PackageJson, ConflictMarker, ResolutionResult, ResolvedConflict, CliOptions} from "./types.js"
+import {parseJsonLenient} from "./json-repair.js"
+import {isNpmLockfile, validateLockfile} from "./lockfile-validator.js"
+import {PackageJson, ConflictMarker, ResolutionResult, ResolvedConflict, CliOptions, LockfileIssue} from "./types.js"
 
 interface MergeOutcome {
   value: any
   conflicts: ResolvedConflict[]
 }
+
+/**
+ * Object fields whose string values are version specs and must be compared
+ * with semver rather than lexicographically.
+ */
+const VERSION_SPEC_PARENT_FIELDS = new Set([
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+  // package-lock.json v1/v2 records the ranges an entry was resolved with
+  "requires",
+  "engines",
+  "overrides",
+  "resolutions",
+])
+
+/**
+ * Fields of a package-lock entry that identify the exact artifact it points
+ * to. They describe one tarball and must never be mixed between two sides.
+ */
+const LOCK_ENTRY_IDENTITY_FIELDS = ["version", "resolved", "integrity"] as const
 
 export class PackageResolver {
   private logger: Logger
@@ -53,6 +77,9 @@ export class PackageResolver {
       if (semanticResult) {
         result.conflicts = semanticResult.conflicts
         result.packageJson = semanticResult.packageJson
+        if (semanticResult.lockfileIssues !== undefined) {
+          result.lockfileIssues = semanticResult.lockfileIssues
+        }
         result.resolved = true
 
         this.logger.success(`Resolved ${result.conflicts.length} conflicts`)
@@ -88,6 +115,7 @@ export class PackageResolver {
         try {
           const parsedJson = this.parseResolvedJson(resolvedContent)
           result.packageJson = parsedJson
+          this.attachLockfileIssues(result, this.parseConflictSides(content))
           result.resolved = true
 
           this.logger.success(`Resolved ${result.conflicts.length} conflicts`)
@@ -120,7 +148,9 @@ export class PackageResolver {
       const baseContent = ConflictParser.hasBaseSections(content)
         ? ConflictParser.extractConflictSide(content, "base")
         : undefined
-      const result = this.mergeJsonContentsInternal(ourContent, theirContent, baseContent)
+      // Each side is stitched together from a line-based merge, so a comma may
+      // be missing or left over at a conflict boundary: parse leniently.
+      const result = this.mergeJsonContentsInternal(ourContent, theirContent, baseContent, {lenient: true})
       return result.resolved ? result : null
     } catch (error) {
       this.logger.debug("Semantic conflict resolution failed, falling back to block-based parser", {
@@ -144,7 +174,12 @@ export class PackageResolver {
   /**
    * Merge JSON contents, optionally with a base document for true three-way merges.
    */
-  private mergeJsonContentsInternal(ourContent: string, theirContent: string, baseContent?: string): ResolutionResult {
+  private mergeJsonContentsInternal(
+    ourContent: string,
+    theirContent: string,
+    baseContent?: string,
+    parseOptions: {lenient?: boolean} = {}
+  ): ResolutionResult {
     const result: ResolutionResult = {
       resolved: false,
       conflicts: [],
@@ -152,6 +187,8 @@ export class PackageResolver {
     }
 
     try {
+      const parse: (text: string) => any = parseOptions.lenient ? parseJsonLenient : JSON.parse
+
       const ourText = this.stripBom(ourContent)
       const theirText = this.stripBom(theirContent)
       const baseText = baseContent !== undefined ? this.stripBom(baseContent) : undefined
@@ -164,8 +201,8 @@ export class PackageResolver {
       }
 
       // A side can be empty (e.g. file added on only one branch): take the other side
-      const ourDocument = ourIsBlank ? undefined : JSON.parse(ourText)
-      const theirDocument = theirIsBlank ? undefined : JSON.parse(theirText)
+      const ourDocument = ourIsBlank ? undefined : parse(ourText)
+      const theirDocument = theirIsBlank ? undefined : parse(theirText)
 
       if (ourDocument === undefined || theirDocument === undefined) {
         const survivor = ourDocument !== undefined ? ourDocument : theirDocument
@@ -178,7 +215,7 @@ export class PackageResolver {
       }
 
       // Empty base (e.g. file added on both branches) means "no common ancestor"
-      const baseDocument = baseText !== undefined && baseText.trim() !== "" ? JSON.parse(baseText) : undefined
+      const baseDocument = baseText !== undefined && baseText.trim() !== "" ? parse(baseText) : undefined
 
       if (!this.isPlainObject(ourDocument) || !this.isPlainObject(theirDocument)) {
         throw new Error("Expected JSON object documents")
@@ -191,12 +228,57 @@ export class PackageResolver {
       const merged = this.mergeValue([], baseDocument, ourDocument, theirDocument)
       result.conflicts = merged.conflicts
       result.packageJson = this.finalizeMergedDocument(merged.value)
+      this.attachLockfileIssues(result, [ourDocument, theirDocument])
       result.resolved = true
     } catch (error) {
       result.errors.push(error instanceof Error ? error.message : String(error))
     }
 
     return result
+  }
+
+  /**
+   * When the merged document is an npm lockfile, record the dependency edges
+   * the merge left unsatisfied. Edges that were already broken in one of the
+   * input documents are not reported: the merge did not cause them.
+   */
+  private attachLockfileIssues(result: ResolutionResult, inputs: unknown[]): void {
+    const merged = result.packageJson
+    if (!isNpmLockfile(merged)) {
+      return
+    }
+
+    const preexisting = new Set<string>()
+    for (const input of inputs) {
+      if (isNpmLockfile(input)) {
+        for (const issue of validateLockfile(input)) {
+          preexisting.add(this.lockfileIssueKey(issue))
+        }
+      }
+    }
+
+    result.lockfileIssues = validateLockfile(merged).filter(issue => !preexisting.has(this.lockfileIssueKey(issue)))
+  }
+
+  private lockfileIssueKey(issue: LockfileIssue): string {
+    return `${issue.from} ${issue.name} ${issue.spec}`
+  }
+
+  /**
+   * Best-effort parse of each side of a conflicted document, used to tell
+   * merge-introduced lockfile problems from pre-existing ones. Sides that do
+   * not parse are simply skipped.
+   */
+  private parseConflictSides(content: string): unknown[] {
+    const documents: unknown[] = []
+    for (const side of ["ours", "theirs"] as const) {
+      try {
+        documents.push(parseJsonLenient(ConflictParser.extractConflictSide(content, side)))
+      } catch {
+        // Unparseable side: nothing to compare against
+      }
+    }
+    return documents
   }
 
   /**
@@ -226,35 +308,114 @@ export class PackageResolver {
         }
 
         return resolved
-      } else if (fieldName.startsWith("node_modules/")) {
-        // For package-lock.json node_modules entries, parse as objects and resolve fields
-        const ourData = ConflictParser.parsePartialJson(conflict.ours)
-        const theirData = ConflictParser.parsePartialJson(conflict.theirs)
-        const resolved = this.resolveNodeModulesConflict(fieldName, ourData, theirData)
-
-        // Store original conflict content for formatting purposes
-        if (resolved) {
-          resolved.originalOurs = conflict.ours
-          resolved.originalTheirs = conflict.theirs
-        }
-
-        return resolved
-      } else {
-        // For simple fields, extract values directly
-        const ourValue = this.extractFieldValue(conflict.ours, fieldName)
-        const theirValue = this.extractFieldValue(conflict.theirs, fieldName)
-        const resolved = this.resolveSimpleConflict(fieldName, ourValue, theirValue)
-
-        // Store original conflict content for formatting purposes (to preserve trailing commas)
-        resolved.originalOurs = conflict.ours
-        resolved.originalTheirs = conflict.theirs
-
-        return resolved
       }
+
+      // A conflict spanning several properties or structural lines (a whole
+      // package-lock entry, or the version/resolved/integrity lines inside
+      // one) cannot be rebuilt property by property without losing data:
+      // keep one side verbatim instead.
+      if (fieldName.startsWith("node_modules/") || this.isCompoundFragment(conflict)) {
+        return this.resolveFragmentVerbatim(fieldName, conflict)
+      }
+
+      // For simple fields, extract values directly
+      const ourValue = this.extractFieldValue(conflict.ours, fieldName)
+      const theirValue = this.extractFieldValue(conflict.theirs, fieldName)
+      const resolved = this.resolveSimpleConflict(fieldName, ourValue, theirValue)
+
+      // Store original conflict content for formatting purposes (to preserve trailing commas)
+      resolved.originalOurs = conflict.ours
+      resolved.originalTheirs = conflict.theirs
+
+      return resolved
     } catch (error) {
       this.logger.error(`Failed to resolve conflict: ${error instanceof Error ? error.message : String(error)}`)
       return null
     }
+  }
+
+  /**
+   * Whether either side of a conflict holds more than a single property:
+   * several `"key": value` lines, or structural lines such as `{` and `}`.
+   */
+  private isCompoundFragment(conflict: ConflictMarker): boolean {
+    return [conflict.ours, conflict.theirs].some(side => {
+      const lines = side.split("\n").filter(line => line.trim() !== "")
+      const keyLines = lines.filter(line => /^\s*"(?:[^"\\]|\\.)*"\s*:/.test(line)).length
+      const structuralLines = lines.filter(line => /^\s*[{}[\]],?\s*$/.test(line)).length
+      return keyLines > 1 || structuralLines > 0
+    })
+  }
+
+  /**
+   * Resolve a multi-property conflict by taking one side as-is. When both
+   * sides carry a version, the strategy picks the winner by version; an empty
+   * side (block deleted or added on one branch only) loses to the side that
+   * still has content; otherwise the strategy picks a side.
+   */
+  private resolveFragmentVerbatim(fieldName: string, conflict: ConflictMarker): ResolvedConflict {
+    const ourVersion = this.fragmentVersion(conflict.ours, fieldName)
+    const theirVersion = this.fragmentVersion(conflict.theirs, fieldName)
+
+    let winnerIsTheirs: boolean
+    if (ourVersion !== undefined && theirVersion !== undefined && ourVersion !== theirVersion) {
+      const resolution = VersionResolver.resolveVersion(ourVersion, theirVersion, this.options.strategy)
+      winnerIsTheirs = resolution.resolved === theirVersion
+    } else if (conflict.ours.trim() === "" || conflict.theirs.trim() === "") {
+      winnerIsTheirs = conflict.ours.trim() === ""
+    } else {
+      winnerIsTheirs = this.options.strategy === "theirs"
+    }
+
+    let winner = winnerIsTheirs ? conflict.theirs : conflict.ours
+    const loser = winnerIsTheirs ? conflict.ours : conflict.theirs
+
+    // More entries may follow in the surrounding JSON: keep a trailing comma
+    // when the other side had one. A superfluous comma is repaired on parse.
+    if (winner.trim() !== "" && !/,\s*$/.test(winner) && /,\s*$/.test(loser)) {
+      winner = `${winner.replace(/\s*$/, "")},`
+    }
+
+    return {
+      field: fieldName,
+      ourValue: conflict.ours,
+      theirValue: conflict.theirs,
+      resolvedValue: winner,
+      strategy: this.options.strategy,
+      verbatim: true,
+      originalOurs: conflict.ours,
+      originalTheirs: conflict.theirs,
+    }
+  }
+
+  /**
+   * Extract the `version` a conflict fragment carries, either directly
+   * (`"version": "1.2.3"` among its lines) or inside the single entry it
+   * declares (`"node_modules/foo": { "version": "1.2.3", ... }`).
+   */
+  private fragmentVersion(side: string, fieldName: string): string | undefined {
+    if (side.trim() === "") {
+      return undefined
+    }
+
+    let data: any
+    try {
+      data = ConflictParser.parsePartialJson(side)
+    } catch {
+      return undefined
+    }
+
+    if (!this.isPlainObject(data)) {
+      return undefined
+    }
+    if (typeof data.version === "string") {
+      return data.version
+    }
+    const entry = data[fieldName]
+    if (this.isPlainObject(entry) && typeof entry.version === "string") {
+      return entry.version
+    }
+    return undefined
   }
 
   /**
@@ -331,70 +492,6 @@ export class PackageResolver {
   }
 
   /**
-   * Resolve node_modules conflicts (for package-lock.json)
-   */
-  private resolveNodeModulesConflict(fieldName: string, ourData: any, theirData: any): ResolvedConflict | null {
-    if (!this.isPlainObject(ourData) || !this.isPlainObject(theirData)) {
-      // Fall back to simple resolution for non-object data
-      const ourValue = typeof ourData === "object" ? JSON.stringify(ourData) : String(ourData)
-      const theirValue = typeof theirData === "object" ? JSON.stringify(theirData) : String(theirData)
-      return this.resolveSimpleConflict(fieldName, ourValue, theirValue)
-    }
-
-    // Lock entries with different versions are resolved atomically so that
-    // version/resolved/integrity never get mixed between the two sides.
-    if (
-      this.isLockPackageEntry(ourData) &&
-      this.isLockPackageEntry(theirData) &&
-      ourData.version !== theirData.version
-    ) {
-      const resolution = VersionResolver.resolveVersion(ourData.version, theirData.version, this.options.strategy)
-      const winner = resolution.resolved === theirData.version ? theirData : ourData
-
-      return {
-        field: fieldName,
-        ourValue: JSON.stringify(ourData, null, 2),
-        theirValue: JSON.stringify(theirData, null, 2),
-        resolvedValue: JSON.stringify(winner, null, 2),
-        strategy: this.options.strategy,
-      }
-    }
-
-    // Merge node_modules entry, resolving field conflicts
-    const merged: Record<string, any> = {}
-    const allKeys = new Set([...Object.keys(ourData), ...Object.keys(theirData)])
-
-    for (const key of allKeys) {
-      const ourValue = ourData[key]
-      const theirValue = theirData[key]
-
-      if (ourValue !== undefined && theirValue !== undefined && ourValue !== theirValue) {
-        // Field conflict - resolve based on field type
-        if (key === "version") {
-          // Version conflict - use version resolution strategy
-          const resolution = VersionResolver.resolveVersion(ourValue, theirValue, this.options.strategy)
-          merged[key] = resolution.resolved
-        } else {
-          // Other fields - use strategy-based resolution
-          const resolution = VersionResolver.resolveNonVersion(ourValue, theirValue, this.options.strategy)
-          merged[key] = resolution.resolved
-        }
-      } else {
-        // No conflict - use whichever exists
-        merged[key] = ourValue !== undefined ? ourValue : theirValue
-      }
-    }
-
-    return {
-      field: fieldName,
-      ourValue: JSON.stringify(ourData, null, 2),
-      theirValue: JSON.stringify(theirData, null, 2),
-      resolvedValue: JSON.stringify(merged, null, 2),
-      strategy: this.options.strategy,
-    }
-  }
-
-  /**
    * Check if field is a dependency field
    */
   private isDependencyField(fieldName: string): boolean {
@@ -464,6 +561,11 @@ export class PackageResolver {
    * Format resolved content for insertion
    */
   private formatResolvedContent(resolved: ResolvedConflict): string {
+    // One side taken as-is: insert it unchanged
+    if (resolved.verbatim) {
+      return resolved.resolvedValue
+    }
+
     // When we couldn't determine the field, don't invent a key: keep one side verbatim
     if (resolved.field === "unknown") {
       const side = this.options.strategy === "theirs" ? resolved.originalTheirs : resolved.originalOurs
@@ -487,10 +589,11 @@ export class PackageResolver {
         const lines = []
 
         if (conflictDeclaresField) {
-          lines.push(`  "${resolved.field}": {`)
+          lines.push(`  ${JSON.stringify(resolved.field)}: {`)
         }
 
-        // Add each dependency/script
+        // Add each dependency/script, JSON-escaped so quotes inside a script
+        // or a non-string value cannot break the document
         const entries = Object.entries(resolvedDeps)
         for (let i = 0; i < entries.length; i++) {
           const entry = entries[i]
@@ -498,7 +601,7 @@ export class PackageResolver {
             const [key, value] = entry
             const isLast = i === entries.length - 1
             const comma = isLast ? "" : ","
-            lines.push(`    "${key}": "${value}"${comma}`)
+            lines.push(`    ${JSON.stringify(key)}: ${JSON.stringify(value)}${comma}`)
           }
         }
 
@@ -519,74 +622,30 @@ export class PackageResolver {
         return lines.join("\n")
       } catch (error) {
         // Fallback to simple formatting
-        return `  "${resolved.field}": ${this.formatJsonValue(resolved.resolvedValue)}`
+        return `  ${JSON.stringify(resolved.field)}: ${this.formatJsonValue(resolved.resolvedValue)}`
       }
-    } else if (resolved.field.startsWith("node_modules/")) {
-      // For package-lock.json node_modules entries, format as multi-line object
-      try {
-        const resolvedObj = JSON.parse(resolved.resolvedValue)
-        const lines = []
-
-        for (const [key, value] of Object.entries(resolvedObj)) {
-          if (typeof value === "string") {
-            lines.push(`      "${key}": "${value}",`)
-          } else {
-            lines.push(`      "${key}": ${JSON.stringify(value)},`)
-          }
-        }
-
-        // Check if original content had trailing comma - if so, keep it
-        const originalHadTrailingComma =
-          (resolved.originalOurs && resolved.originalOurs.trim().endsWith(",")) ||
-          (resolved.originalTheirs && resolved.originalTheirs.trim().endsWith(","))
-
-        if (!originalHadTrailingComma && lines.length > 0) {
-          // Remove trailing comma from last line only if original didn't have one
-          const lastLine = lines[lines.length - 1]
-          if (lastLine) {
-            lines[lines.length - 1] = lastLine.replace(/,$/, "")
-          }
-        }
-
-        return lines.join("\n")
-      } catch (error) {
-        // Fallback to simple formatting
-        return resolved.resolvedValue
-      }
-    } else {
-      // For simple values, format as JSON property
-      const value = this.formatJsonValue(resolved.resolvedValue)
-
-      // Check if original content had trailing comma - if so, preserve it
-      const originalHadTrailingComma =
-        (resolved.originalOurs && resolved.originalOurs.trim().endsWith(",")) ||
-        (resolved.originalTheirs && resolved.originalTheirs.trim().endsWith(","))
-
-      const comma = originalHadTrailingComma ? "," : ""
-      return `  "${resolved.field}": ${value}${comma}`
     }
+
+    // For simple values, format as JSON property
+    const value = this.formatJsonValue(resolved.resolvedValue)
+
+    // Check if original content had trailing comma - if so, preserve it
+    const originalHadTrailingComma =
+      (resolved.originalOurs && resolved.originalOurs.trim().endsWith(",")) ||
+      (resolved.originalTheirs && resolved.originalTheirs.trim().endsWith(","))
+
+    const comma = originalHadTrailingComma ? "," : ""
+    return `  ${JSON.stringify(resolved.field)}: ${value}${comma}`
   }
 
   /**
    * Parse fallback-resolved content. Block-based resolution can leave a
-   * trailing comma before a closing brace (a common merge artifact when the
-   * conflicted side ended with one), so retry with trailing commas stripped
-   * before giving up.
+   * trailing comma before a closing brace or a missing comma between two
+   * blocks (common artifacts when a conflicted side ended with or without
+   * one), so parse leniently before giving up.
    */
   private parseResolvedJson(content: string): any {
-    try {
-      return JSON.parse(content)
-    } catch (error) {
-      const repaired = content.replace(/,(\s*[}\]])/g, "$1")
-      if (repaired !== content) {
-        try {
-          return JSON.parse(repaired)
-        } catch {
-          // Fall through to the original, more useful error
-        }
-      }
-      throw error
-    }
+    return parseJsonLenient(content)
   }
 
   /**
@@ -659,13 +718,15 @@ export class PackageResolver {
       return {value: undefined, conflicts: []}
     }
 
-    const preferStrategyResolution = this.shouldResolveAsVersion(path, ourValue, theirValue)
-
-    if (!preferStrategyResolution && this.isUnchangedFromBase(ourValue, baseValue)) {
+    // True three-way merge: a side that did not touch a value never overrides
+    // the side that did, whatever the strategy says. The strategy only decides
+    // real conflicts, where both sides changed the same value differently —
+    // the same rule Git applies with `-X ours` / `-X theirs`.
+    if (this.isUnchangedFromBase(ourValue, baseValue)) {
       return {value: theirValue, conflicts: []}
     }
 
-    if (!preferStrategyResolution && this.isUnchangedFromBase(theirValue, baseValue)) {
+    if (this.isUnchangedFromBase(theirValue, baseValue)) {
       return {value: ourValue, conflicts: []}
     }
 
@@ -681,12 +742,14 @@ export class PackageResolver {
       return {value: ourValue, conflicts: []}
     }
 
-    // Lockfile package entries must stay internally consistent: version, resolved
-    // and integrity belong together, so never merge them field-by-field.
+    // Lockfile package entries must stay internally consistent: version,
+    // resolved and integrity describe one artifact and can never be mixed
+    // between sides, so entries pointing at different artifacts are resolved
+    // as a whole rather than field by field.
     if (
-      this.isLockPackageEntry(ourValue) &&
-      this.isLockPackageEntry(theirValue) &&
-      ourValue.version !== theirValue.version
+      this.isPlainObject(ourValue) &&
+      this.isPlainObject(theirValue) &&
+      this.isLockEntryConflict(path, ourValue, theirValue)
     ) {
       return this.mergeLockPackageEntry(path, ourValue, theirValue)
     }
@@ -762,6 +825,32 @@ export class PackageResolver {
   }
 
   /**
+   * package-lock.json v2/v3 maps install locations to entries under
+   * "packages"; every key except "" (the root project) is a package entry,
+   * including bundled packages and workspace links that carry no integrity.
+   */
+  private isLockEntryPath(path: string[]): boolean {
+    return path.length === 2 && path[0] === "packages" && path[1] !== ""
+  }
+
+  /**
+   * Whether two lock entries point at different artifacts. A field missing on
+   * one side is not a difference: the other side simply fills it in.
+   */
+  private isLockEntryConflict(path: string[], ourValue: Record<string, any>, theirValue: Record<string, any>): boolean {
+    const looksLikeEntry =
+      this.isLockEntryPath(path) || (this.isLockPackageEntry(ourValue) && this.isLockPackageEntry(theirValue))
+
+    return (
+      looksLikeEntry &&
+      LOCK_ENTRY_IDENTITY_FIELDS.some(
+        field =>
+          ourValue[field] !== undefined && theirValue[field] !== undefined && ourValue[field] !== theirValue[field]
+      )
+    )
+  }
+
+  /**
    * Resolve a lockfile entry conflict atomically: pick the side whose version
    * wins under the strategy and keep all of its correlated fields together.
    */
@@ -770,8 +859,21 @@ export class PackageResolver {
     ourValue: Record<string, any>,
     theirValue: Record<string, any>
   ): MergeOutcome {
-    const resolution = VersionResolver.resolveVersion(ourValue.version, theirValue.version, this.options.strategy)
-    const winner = resolution.resolved === theirValue.version ? theirValue : ourValue
+    let winner: Record<string, any>
+
+    if (
+      typeof ourValue.version === "string" &&
+      typeof theirValue.version === "string" &&
+      ourValue.version !== theirValue.version
+    ) {
+      const resolution = VersionResolver.resolveVersion(ourValue.version, theirValue.version, this.options.strategy)
+      winner = resolution.resolved === theirValue.version ? theirValue : ourValue
+    } else {
+      // Same version but a different artifact (another git commit, registry
+      // mirror or integrity algorithm): there is no "higher" side, so keep
+      // ours unless the strategy explicitly asks for theirs.
+      winner = this.options.strategy === "theirs" ? theirValue : ourValue
+    }
 
     return {
       value: winner,
@@ -820,6 +922,11 @@ export class PackageResolver {
     return isDeepStrictEqual(value, baseValue)
   }
 
+  /**
+   * Whether two conflicting strings are version specs: the "version" field
+   * itself, a corepack "packageManager" spec, or any entry of a field that
+   * maps package names to ranges (dependencies, engines, requires, ...).
+   */
   private shouldResolveAsVersion(path: string[], ourValue: any, theirValue: any): boolean {
     if (typeof ourValue !== "string" || typeof theirValue !== "string") {
       return false
@@ -828,7 +935,11 @@ export class PackageResolver {
     const currentKey = path[path.length - 1]
     const parentKey = path[path.length - 2]
 
-    return currentKey === "version" || this.isDependencyField(parentKey || "")
+    return (
+      currentKey === "version" ||
+      currentKey === "packageManager" ||
+      (parentKey !== undefined && VERSION_SPEC_PARENT_FIELDS.has(parentKey))
+    )
   }
 
   private stringifyConflictValue(value: any): string {

@@ -5,10 +5,12 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 ## Features
 
 - **Automatic conflict resolution** with configurable strategies
+- **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`)
 - **Smart version resolution** using semver (ranges, pre-releases, and non-registry specs like `workspace:`, `file:`, and git URLs are handled safely)
 - **Git integration** as merge driver or in hooks
 - **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers (diff3 base sections enable true 3-way merges)
-- **Lockfile-safe merging** - `version`, `resolved`, and `integrity` of a package-lock entry are always kept together
+- **Lockfile-safe merging** - a package-lock entry is resolved as a whole: `version`, `resolved`, and `integrity` are never mixed between branches
+- **Lockfile consistency check** - every merged `package-lock.json` is verified against its own dependency graph, so a lockfile `npm ci` would reject is never committed silently (see [Lockfile consistency](#lockfile-consistency))
 - **npm, yarn, pnpm, and bun aware** - npm lockfiles are merged directly; conflicted `yarn.lock` / `pnpm-lock.yaml` / `bun.lock` files are fixed by their own package manager without installing `node_modules` (see the table below), and the tool never creates a lockfile for a package manager your project doesn't use
 - **Stable JSON formatting** - preserves field order, indentation (tabs/spaces), and line endings (LF/CRLF)
 - **Cross-platform** - works on Linux, macOS, and Windows
@@ -78,6 +80,33 @@ Regeneration only runs for lockfiles that already exist in your project, never i
 - `ours` - Use our version (current branch)
 - `theirs` - Use their version (incoming branch)
 
+Strategies only decide **real conflicts**: fields that both branches changed to different values. When the common ancestor is known (merge driver, or `diff3`/`zdiff3` conflict markers), a field changed on one branch only is taken from that branch regardless of the strategy — exactly like Git itself. With default-style conflict markers (no ancestor) every differing field is treated as a conflict.
+
+With `highest`, a stable release beats a pre-release even when the pre-release has a higher base version (`2.68.6` wins over `2.68.4-beta.3`, `^1.9.0` wins over `^2.0.0-beta.1`). Two pre-releases, or two stable versions, compare by semver precedence. The same rule applies to package.json ranges and to the exact versions in package-lock.json, so both files always land on the same side.
+
+### Lockfile consistency
+
+Merging two lockfiles entry by entry can produce a file that is valid JSON but describes a dependency graph npm refuses to install — for example one branch pinned `foo@1.2.0` while the other refreshed the lockfile to `foo@1.5.0`, so the root now requires `1.2.0` but `node_modules/foo` is `1.5.0`. `npm ci` fails on such lockfiles ("package.json and package-lock.json are not in sync").
+
+After every `package-lock.json` / `npm-shrinkwrap.json` merge the tool therefore checks that each declared dependency (including transitive ones, workspace links and `npm:` aliases) is satisfied by the locked version, and reports the edges that are not:
+
+- **CLI**: the lockfile is regenerated with `npm install --package-lock-only` (the default), which fixes the graph. With `--no-regenerate-lock`, or when regeneration fails, the unsatisfied dependencies are printed and the command exits with code 1. `--dry-run` only warns.
+- **Merge driver**: the driver cannot regenerate the lockfile (Git merges `package-lock.json` before `package.json`), so it writes the best-effort merge, prints the unsatisfied dependencies, and exits 1. Git then keeps the file marked as conflicted (the worktree copy contains the merged content, without markers) and you finish with:
+
+  ```bash
+  npm install --package-lock-only
+  git add package-lock.json
+  git commit
+  ```
+
+  To accept such merges anyway, add `--allow-inconsistent-lockfile` to the merge driver command:
+
+  ```bash
+  git config merge.package-conflicts-resolver.driver "npx package-conflicts-resolver merge-driver %A %O %B --allow-inconsistent-lockfile"
+  ```
+
+Problems that already existed in one of the branches' lockfiles are not blamed on the merge, and lockfiles without a `packages` section (`lockfileVersion` 1) are not checked.
+
 ### Commands
 
 ```bash
@@ -100,6 +129,7 @@ npx package-conflicts-resolver verify           # Verify Git integration is work
 -v, --verbose                 Enable verbose logging
 --no-regenerate-lock          Skip package-lock.json regeneration
 --skip-gitattributes          Skip automatic .gitattributes setup (for setup command)
+--allow-inconsistent-lockfile Accept an inconsistent merged lockfile (for merge-driver command)
 ```
 
 ### Global Setup
@@ -255,6 +285,20 @@ const result = await resolver.resolveConflicts(conflictedContent)
 if (result.resolved && result.packageJson) {
   await resolver.writeResolvedPackage(result.packageJson, "package.json")
 }
+
+// For lockfiles, `result.lockfileIssues` lists dependency edges the merged
+// lockfile does not satisfy (empty when it is consistent):
+const lockResult = await resolver.resolveConflicts(conflictedLockfileContent)
+if (lockResult.lockfileIssues?.length) {
+  console.warn(
+    "Regenerate the lockfile:",
+    lockResult.lockfileIssues.map(issue => issue.message)
+  )
+}
+
+// The check is also available on its own
+import {validateLockfile} from "package-conflicts-resolver"
+const issues = validateLockfile(JSON.parse(lockfileText), JSON.parse(packageJsonText))
 ```
 
 ## Troubleshooting
@@ -324,6 +368,10 @@ package-conflicts-resolver verify
 **"Git merge driver is NOT configured"**
 
 - Run `package-conflicts-resolver setup` to configure the merge driver.
+
+**"merged lockfile is not consistent" during `git merge`**
+
+- The two branches' lockfiles cannot be combined into a graph that satisfies every dependency (the message lists the ones that fail). Run `npm install --package-lock-only`, then `git add package-lock.json` and finish the merge. See [Lockfile consistency](#lockfile-consistency).
 
 **.gitattributes not working**
 

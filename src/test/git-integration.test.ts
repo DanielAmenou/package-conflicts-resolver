@@ -310,3 +310,158 @@ describe("real git merge through the merge driver", () => {
     })
   })
 })
+
+describe("real git merge: package.json and package-lock.json together", () => {
+  const pkg = (deps: Record<string, string>) =>
+    JSON.stringify({name: "app", version: "1.0.0", dependencies: deps}, null, 2) + "\n"
+
+  const lockEntry = (name: string, version: string) => ({
+    version,
+    resolved: `https://registry.npmjs.org/${name}/-/${name}-${version}.tgz`,
+    integrity: `sha512-${name}-${version}`,
+  })
+
+  const lock = (deps: Record<string, string>, versions: Record<string, string>) =>
+    JSON.stringify(
+      {
+        name: "app",
+        version: "1.0.0",
+        lockfileVersion: 3,
+        requires: true,
+        packages: {
+          "": {name: "app", version: "1.0.0", dependencies: deps},
+          ...Object.fromEntries(
+            Object.entries(versions).map(([name, version]) => [`node_modules/${name}`, lockEntry(name, version)])
+          ),
+        },
+      },
+      null,
+      2
+    ) + "\n"
+
+  async function configureDriver(dir: string): Promise<void> {
+    await runGit(
+      [
+        "config",
+        "merge.package-conflicts-resolver.driver",
+        `"${process.execPath}" "${CLI_PATH}" merge-driver %A %O %B`,
+      ],
+      dir
+    )
+    await writeFile(
+      join(dir, ".gitattributes"),
+      "package.json merge=package-conflicts-resolver\npackage-lock.json merge=package-conflicts-resolver\n"
+    )
+  }
+
+  test("one-sided changes on each branch merge into a consistent lockfile", async () => {
+    await withGitRepo(async dir => {
+      await configureDriver(dir)
+      await writeFile(join(dir, "package.json"), pkg({foo: "^1.5.0", bar: "^1.0.0"}))
+      await writeFile(
+        join(dir, "package-lock.json"),
+        lock({foo: "^1.5.0", bar: "^1.0.0"}, {foo: "1.5.0", bar: "1.0.0"})
+      )
+      await commitAll(dir, "base")
+
+      // feature pins foo lower; main bumps bar: neither touches the other's package
+      await runGit(["checkout", "-b", "feature"], dir)
+      await writeFile(join(dir, "package.json"), pkg({foo: "1.2.0", bar: "^1.0.0"}))
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "1.2.0", bar: "^1.0.0"}, {foo: "1.2.0", bar: "1.0.0"}))
+      await commitAll(dir, "pin foo")
+
+      await runGit(["checkout", "main"], dir)
+      await writeFile(join(dir, "package.json"), pkg({foo: "^1.5.0", bar: "^1.1.0"}))
+      await writeFile(
+        join(dir, "package-lock.json"),
+        lock({foo: "^1.5.0", bar: "^1.1.0"}, {foo: "1.5.0", bar: "1.1.0"})
+      )
+      await commitAll(dir, "bump bar")
+
+      const merge = await runGit(["merge", "feature"], dir)
+      assert.equal(merge.code, 0, `merge should auto-resolve: ${merge.stdout}\n${merge.stderr}`)
+
+      const mergedPkg = JSON.parse(await readFile(join(dir, "package.json"), "utf8"))
+      assert.deepEqual(mergedPkg.dependencies, {foo: "1.2.0", bar: "^1.1.0"})
+
+      const mergedLock = JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8"))
+      assert.deepEqual(mergedLock.packages[""].dependencies, {foo: "1.2.0", bar: "^1.1.0"})
+      assert.equal(mergedLock.packages["node_modules/foo"].version, "1.2.0")
+      assert.equal(mergedLock.packages["node_modules/foo"].integrity, "sha512-foo-1.2.0")
+      assert.equal(mergedLock.packages["node_modules/bar"].version, "1.1.0")
+    })
+  })
+
+  test("leaves package-lock.json conflicted when the merged graph is inconsistent", async () => {
+    await withGitRepo(async dir => {
+      await configureDriver(dir)
+      await writeFile(join(dir, "package.json"), pkg({foo: "^1.0.0"}))
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "^1.0.0"}, {foo: "1.0.0"}))
+      await commitAll(dir, "base")
+
+      // feature pins foo to 1.2.0 (package.json + lockfile)
+      await runGit(["checkout", "-b", "feature"], dir)
+      await writeFile(join(dir, "package.json"), pkg({foo: "1.2.0"}))
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "1.2.0"}, {foo: "1.2.0"}))
+      await commitAll(dir, "pin foo")
+
+      // main only refreshed the lockfile to foo 1.5.0 (still within ^1.0.0)
+      await runGit(["checkout", "main"], dir)
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "^1.0.0"}, {foo: "1.5.0"}))
+      await commitAll(dir, "refresh lock")
+
+      const merge = await runGit(["merge", "feature"], dir)
+      assert.notEqual(merge.code, 0, "the merge must stop on the inconsistent lockfile")
+      assert.match(merge.stderr, /merged lockfile is not consistent/)
+      assert.match(merge.stderr, /the root project requires foo@1\.2\.0 but node_modules\/foo is 1\.5\.0/)
+      assert.match(merge.stderr, /npm install --package-lock-only/)
+
+      // package.json only changed on feature: Git took it as-is
+      assert.deepEqual(JSON.parse(await readFile(join(dir, "package.json"), "utf8")).dependencies, {foo: "1.2.0"})
+
+      // The lockfile is left unmerged for npm, with the best-effort merge in the worktree (no markers)
+      const status = await runGit(["status", "--porcelain"], dir)
+      assert.match(status.stdout, /^UU package-lock\.json$/m)
+      const lockContent = await readFile(join(dir, "package-lock.json"), "utf8")
+      assert(!lockContent.includes("<<<<<<<"), "no conflict markers in the merged lockfile")
+      const mergedLock = JSON.parse(lockContent)
+      assert.equal(mergedLock.packages[""].dependencies.foo, "1.2.0")
+      assert.equal(mergedLock.packages["node_modules/foo"].version, "1.5.0")
+
+      // Simulate what `npm install --package-lock-only` produces, then finish the merge
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "1.2.0"}, {foo: "1.2.0"}))
+      await runGit(["add", "package-lock.json"], dir)
+      const commit = await runGit(["commit", "--no-edit"], dir)
+      assert.equal(commit.code, 0, commit.stderr)
+    })
+  })
+
+  test("--allow-inconsistent-lockfile lets the merge through", async () => {
+    await withGitRepo(async dir => {
+      await configureDriver(dir)
+      await runGit(
+        [
+          "config",
+          "merge.package-conflicts-resolver.driver",
+          `"${process.execPath}" "${CLI_PATH}" merge-driver %A %O %B --allow-inconsistent-lockfile`,
+        ],
+        dir
+      )
+      await writeFile(join(dir, "package.json"), pkg({foo: "^1.0.0"}))
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "^1.0.0"}, {foo: "1.0.0"}))
+      await commitAll(dir, "base")
+
+      await runGit(["checkout", "-b", "feature"], dir)
+      await writeFile(join(dir, "package.json"), pkg({foo: "1.2.0"}))
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "1.2.0"}, {foo: "1.2.0"}))
+      await commitAll(dir, "pin foo")
+
+      await runGit(["checkout", "main"], dir)
+      await writeFile(join(dir, "package-lock.json"), lock({foo: "^1.0.0"}, {foo: "1.5.0"}))
+      await commitAll(dir, "refresh lock")
+
+      const merge = await runGit(["merge", "feature"], dir)
+      assert.equal(merge.code, 0, `merge should be accepted: ${merge.stdout}\n${merge.stderr}`)
+    })
+  })
+})

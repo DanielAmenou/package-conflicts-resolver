@@ -9,6 +9,8 @@ export {VersionResolver} from "./version-resolver.js"
 export {Logger} from "./logger.js"
 export {LOCKFILES, findLockfiles, detectPackageManager} from "./package-manager.js"
 export type {PackageManagerName, LockfileInfo} from "./package-manager.js"
+export {isNpmLockfile, validateLockfile, formatLockfileIssues, resolveLockfileDependency} from "./lockfile-validator.js"
+export {parseJsonLenient} from "./json-repair.js"
 
 export * from "./types.js"
 

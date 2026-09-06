@@ -386,12 +386,16 @@ describe("CLI Integration Tests", () => {
       const resolvedContent = await readFile(join(repoDir, "package.json"), "utf8")
       assert(!resolvedContent.includes("<<<<<<<"))
 
+      // The merge driver sees the common ancestor, so this is a true 3-way
+      // merge: only the feature branch touched lodash (a deliberate downgrade
+      // from ^4.17.21), so its change is kept — the strategy only decides
+      // fields both branches changed, like "version".
       const resolvedPackage = JSON.parse(resolvedContent)
       assert.deepEqual(resolvedPackage, {
         name: "demo",
         version: "2.0.0",
         dependencies: {
-          lodash: "^4.17.21",
+          lodash: "^4.17.20",
           express: "^4.18.0",
           react: "^18.0.0",
         },

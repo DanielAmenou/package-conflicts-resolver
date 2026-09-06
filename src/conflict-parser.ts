@@ -189,9 +189,16 @@ export class ConflictParser {
     // First, try to extract from the conflict content itself
     const lines_conflict = conflictContent.trim().split("\n")
     for (const line of lines_conflict) {
-      const match = line.match(/^\s*"([^"]+)"\s*:/)
+      const match = line.match(/^\s*"([^"]+)"\s*:(.*)$/)
       if (match) {
         const fieldName = match[1]
+        const rawValue = (match[2] ?? "").trim()
+        // A key that opens a nested object or array names that structure
+        // (`"node_modules/lodash": {`, `"engines": {`): it is not an entry
+        // of a dependencies map, however package-like it looks
+        if (fieldName && (rawValue.startsWith("{") || rawValue.startsWith("["))) {
+          return fieldName
+        }
         // If it looks like a dependency (contains @, /, or common package patterns)
         // But exclude common package.json fields
         const packageJsonFields = [

@@ -379,3 +379,306 @@ describe("CLI merge-driver (as invoked by Git)", () => {
     })
   })
 })
+
+const j = (value: unknown) => JSON.stringify(value, null, 2) + "\n"
+
+const lockEntry = (name: string, version: string) => ({
+  version,
+  resolved: `https://registry.npmjs.org/${name}/-/${name}-${version}.tgz`,
+  integrity: `sha512-${name}-${version}`,
+})
+
+const lockWith = (rootDeps: Record<string, string>, packages: Record<string, any>) =>
+  j({
+    name: "app",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: {"": {name: "app", version: "1.0.0", dependencies: rootDeps}, ...packages},
+  })
+
+describe("CLI merge-driver lockfile consistency", () => {
+  // Ours kept the range and moved the lock to 1.5.0; theirs pinned 1.2.0. The
+  // range comparison picks the pin, the exact comparison picks 1.5.0: the
+  // merged lockfile cannot satisfy its own root.
+  const current = lockWith({foo: "^1.0.0"}, {"node_modules/foo": lockEntry("foo", "1.5.0")})
+  const other = lockWith({foo: "1.2.0"}, {"node_modules/foo": lockEntry("foo", "1.2.0")})
+
+  test("exits 1 and explains when the merged lockfile is inconsistent", async () => {
+    await withTempDir(async dir => {
+      const currentPath = join(dir, "current.json")
+      await writeFile(currentPath, current, "utf8")
+      await writeFile(join(dir, "base.json"), "", "utf8")
+      await writeFile(join(dir, "other.json"), other, "utf8")
+
+      const result = await runCli(["merge-driver", currentPath, join(dir, "base.json"), join(dir, "other.json")], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /not consistent/)
+      assert.match(result.stderr, /the root project requires foo@1\.2\.0 but node_modules\/foo is 1\.5\.0/)
+      assert.match(result.stderr, /npm install --package-lock-only/)
+      assert.match(result.stderr, /--allow-inconsistent-lockfile/)
+
+      // The best-effort merge is still written so npm can start from it
+      const written = JSON.parse(await readFile(currentPath, "utf8"))
+      assert.equal(written.packages[""].dependencies.foo, "1.2.0")
+      assert.equal(written.packages["node_modules/foo"].version, "1.5.0")
+    })
+  })
+
+  test("--allow-inconsistent-lockfile accepts the merge", async () => {
+    await withTempDir(async dir => {
+      const currentPath = join(dir, "current.json")
+      await writeFile(currentPath, current, "utf8")
+      await writeFile(join(dir, "base.json"), "", "utf8")
+      await writeFile(join(dir, "other.json"), other, "utf8")
+
+      const result = await runCli(
+        ["merge-driver", currentPath, join(dir, "base.json"), join(dir, "other.json"), "--allow-inconsistent-lockfile"],
+        dir
+      )
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stderr, "")
+    })
+  })
+
+  test("a consistent merge exits 0 silently", async () => {
+    await withTempDir(async dir => {
+      const currentPath = join(dir, "current.json")
+      await writeFile(currentPath, lockWith({foo: "^1.0.0"}, {"node_modules/foo": lockEntry("foo", "1.5.0")}), "utf8")
+      await writeFile(
+        join(dir, "base.json"),
+        lockWith({foo: "^1.0.0"}, {"node_modules/foo": lockEntry("foo", "1.0.0")}),
+        "utf8"
+      )
+      await writeFile(
+        join(dir, "other.json"),
+        lockWith({foo: "^1.0.0"}, {"node_modules/foo": lockEntry("foo", "1.3.0")}),
+        "utf8"
+      )
+
+      const result = await runCli(["merge-driver", currentPath, join(dir, "base.json"), join(dir, "other.json")], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stderr, "")
+      assert.equal(JSON.parse(await readFile(currentPath, "utf8")).packages["node_modules/foo"].version, "1.5.0")
+    })
+  })
+
+  test("a one-sided change is kept even when the strategy would prefer the other value", async () => {
+    await withTempDir(async dir => {
+      const currentPath = join(dir, "current.json")
+      const base = lockWith(
+        {foo: "^1.5.0", bar: "^1.0.0"},
+        {"node_modules/foo": lockEntry("foo", "1.5.0"), "node_modules/bar": lockEntry("bar", "1.0.0")}
+      )
+      const ours = lockWith(
+        {foo: "^1.5.0", bar: "^1.1.0"},
+        {"node_modules/foo": lockEntry("foo", "1.5.0"), "node_modules/bar": lockEntry("bar", "1.1.0")}
+      )
+      const theirs = lockWith(
+        {foo: "1.2.0", bar: "^1.0.0"},
+        {"node_modules/foo": lockEntry("foo", "1.2.0"), "node_modules/bar": lockEntry("bar", "1.0.0")}
+      )
+      await writeFile(currentPath, ours, "utf8")
+      await writeFile(join(dir, "base.json"), base, "utf8")
+      await writeFile(join(dir, "other.json"), theirs, "utf8")
+
+      const result = await runCli(["merge-driver", currentPath, join(dir, "base.json"), join(dir, "other.json")], dir)
+      assert.equal(result.code, 0, result.stderr)
+
+      const merged = JSON.parse(await readFile(currentPath, "utf8"))
+      assert.equal(merged.packages[""].dependencies.foo, "1.2.0")
+      assert.equal(merged.packages["node_modules/foo"].version, "1.2.0")
+      assert.equal(merged.packages[""].dependencies.bar, "^1.1.0")
+      assert.equal(merged.packages["node_modules/bar"].version, "1.1.0")
+    })
+  })
+})
+
+describe("CLI lockfile consistency without regeneration", () => {
+  const CONFLICTED_INCONSISTENT_LOCK = [
+    "{",
+    '  "name": "app",',
+    '  "version": "1.0.0",',
+    '  "lockfileVersion": 3,',
+    '  "packages": {',
+    '    "": {',
+    '      "name": "app",',
+    '      "dependencies": {',
+    "<<<<<<< HEAD",
+    '        "foo": "^1.0.0"',
+    "=======",
+    '        "foo": "1.2.0"',
+    ">>>>>>> feature",
+    "      }",
+    "    },",
+    '    "node_modules/foo": {',
+    "<<<<<<< HEAD",
+    '      "version": "1.5.0",',
+    '      "resolved": "https://r/foo-1.5.0.tgz",',
+    '      "integrity": "sha512-a"',
+    "=======",
+    '      "version": "1.2.0",',
+    '      "resolved": "https://r/foo-1.2.0.tgz",',
+    '      "integrity": "sha512-b"',
+    ">>>>>>> feature",
+    "    }",
+    "  }",
+    "}",
+    "",
+  ].join("\n")
+
+  test("exits 1 with the unsatisfied edges when the merged lockfile is inconsistent", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_INCONSISTENT_LOCK, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /package-lock\.json was merged but its dependency graph is not consistent/)
+      assert.match(result.stderr, /the root project requires foo@1\.2\.0 but node_modules\/foo is 1\.5\.0/)
+      assert.match(result.stderr, /npm install --package-lock-only/)
+
+      // The merge itself is written: no markers are left behind
+      const lock = await readFile(join(dir, "package-lock.json"), "utf8")
+      assert(!lock.includes("<<<<<<<"))
+      assert.equal(JSON.parse(lock).packages["node_modules/foo"].version, "1.5.0")
+    })
+  })
+
+  test("checks the root against package.json, not only against the lockfile's own root entry", async () => {
+    await withTempDir(async dir => {
+      // The lockfile is internally consistent (its root says ^1.0.0) but the
+      // resolved package.json pins a version the lockfile does not provide
+      const lock = [
+        "{",
+        '  "name": "app",',
+        '  "lockfileVersion": 3,',
+        '  "packages": {',
+        '    "": {',
+        '      "name": "app",',
+        '      "dependencies": {',
+        '        "foo": "^1.0.0"',
+        "      }",
+        "    },",
+        '    "node_modules/foo": {',
+        "<<<<<<< HEAD",
+        '      "version": "1.5.0",',
+        '      "integrity": "sha512-a"',
+        "=======",
+        '      "version": "1.4.0",',
+        '      "integrity": "sha512-b"',
+        ">>>>>>> feature",
+        "    }",
+        "  }",
+        "}",
+        "",
+      ].join("\n")
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), lock, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /requires foo@1\.2\.0 but node_modules\/foo is 1\.5\.0/)
+    })
+  })
+
+  test("dry run only warns and exits 0", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_INCONSISTENT_LOCK, "utf8")
+
+      const result = await runCli(["--dry-run", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.match(result.stderr, /would be merged with 1 unsatisfied dependency/)
+      assert.equal(await readFile(join(dir, "package-lock.json"), "utf8"), CONFLICTED_INCONSISTENT_LOCK)
+    })
+  })
+
+  test("--json keeps stdout machine-readable while reporting on stderr", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_INCONSISTENT_LOCK, "utf8")
+
+      const result = await runCli(["--json", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      for (const line of result.stdout.split("\n").filter(line => line.trim() !== "")) {
+        assert.doesNotThrow(() => JSON.parse(line), `not valid JSON: ${line}`)
+      }
+      assert.match(result.stderr, /not consistent/)
+    })
+  })
+
+  test("a consistent lockfile merge exits 0", async () => {
+    await withTempDir(async dir => {
+      const lock = [
+        "{",
+        '  "name": "app",',
+        '  "lockfileVersion": 3,',
+        '  "packages": {',
+        '    "": {',
+        '      "name": "app",',
+        '      "dependencies": {',
+        '        "foo": "^1.0.0"',
+        "      }",
+        "    },",
+        '    "node_modules/foo": {',
+        "<<<<<<< HEAD",
+        '      "version": "1.5.0",',
+        '      "integrity": "sha512-a"',
+        "=======",
+        '      "version": "1.4.0",',
+        '      "integrity": "sha512-b"',
+        ">>>>>>> feature",
+        "    }",
+        "  }",
+        "}",
+        "",
+      ].join("\n")
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "^1.0.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), lock, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stderr, "")
+      assert.equal(
+        JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8")).packages["node_modules/foo"].version,
+        "1.5.0"
+      )
+    })
+  })
+
+  test("targeting an inconsistent package-lock.json directly is reported too", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_INCONSISTENT_LOCK, "utf8")
+
+      const result = await runCli(["package-lock.json", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /package-lock\.json was merged but its dependency graph is not consistent/)
+    })
+  })
+})
