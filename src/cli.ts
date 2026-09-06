@@ -11,6 +11,7 @@ import {basename, dirname, join, resolve} from "node:path"
 import {readFile, access} from "fs/promises"
 import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
+import {Logger} from "./logger.js"
 import {LOCKFILES, PackageManagerName, findLockfiles, resolveSafeRegenCommand} from "./package-manager.js"
 import {formatLockfileIssues, isNpmLockfile, validateLockfile} from "./lockfile-validator.js"
 import {RESOLUTION_STRATEGIES, CliOptions, LockfileIssue, PackageJson, ResolutionResult} from "./types.js"
@@ -337,7 +338,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     options.regenerateLock &&
     !options.dryRun
   ) {
-    regenerated = await regenerateLockfiles(dir, options.quiet, lockStatus.regenerated)
+    regenerated = await regenerateLockfiles(dir, options, lockStatus.regenerated)
   }
 
   // npm rewrites its lockfile from package.json while regenerating: that heals
@@ -573,13 +574,19 @@ async function resolveCompanionLockfiles(
  * package manager the project doesn't use. Returns the package managers whose
  * lockfile was regenerated successfully (including the ones passed in).
  */
-async function regenerateLockfiles(dir: string, quiet: boolean, alreadyRegenerated: Set<string>): Promise<Set<string>> {
+async function regenerateLockfiles(
+  dir: string,
+  options: CliOptions,
+  alreadyRegenerated: Set<string>
+): Promise<Set<string>> {
   const regenerated = new Set<string>(alreadyRegenerated)
   const lockfiles = await findLockfiles(dir)
   if (lockfiles.length === 0) {
     return regenerated // Lockless project: nothing to regenerate
   }
 
+  // Progress goes through the logger so `--json` keeps stdout machine-readable
+  const logger = new Logger({quiet: options.quiet, json: options.json, verbose: options.verbose})
   const handled = new Set<string>(alreadyRegenerated)
 
   for (const lockfile of lockfiles) {
@@ -587,20 +594,20 @@ async function regenerateLockfiles(dir: string, quiet: boolean, alreadyRegenerat
     handled.add(lockfile.packageManager)
 
     const safeRegenCommand = await resolveSafeRegenCommand(dir, lockfile)
-    if (safeRegenCommand) {
-      if (!quiet) {
-        console.log(`ℹ Regenerating ${lockfile.name} with ${lockfile.packageManager}...`)
-      }
-      const ok = await runLockfileCommand(safeRegenCommand, dir, quiet)
-      if (ok) {
-        regenerated.add(lockfile.packageManager)
-        if (!quiet) console.log(`✅ Regenerated ${lockfile.name}`)
-      } else if (!quiet) {
-        console.warn(`⚠️ Failed to regenerate ${lockfile.name}`)
-        console.log(`ℹ You may need to run "${lockfile.manualCommand}" manually`)
-      }
-    } else if (!quiet) {
-      console.log(`ℹ Run "${lockfile.manualCommand}" to update ${lockfile.name} after this merge.`)
+    if (!safeRegenCommand) {
+      logger.info(`Run "${lockfile.manualCommand}" to update ${lockfile.name} after this merge.`)
+      continue
+    }
+
+    logger.info(`Regenerating ${lockfile.name} with ${lockfile.packageManager}...`)
+    // The package manager's own output would corrupt --json stdout
+    const ok = await runLockfileCommand(safeRegenCommand, dir, options.quiet || options.json)
+    if (ok) {
+      regenerated.add(lockfile.packageManager)
+      logger.success(`Regenerated ${lockfile.name}`)
+    } else if (!options.quiet) {
+      logger.warn(`Failed to regenerate ${lockfile.name}`)
+      logger.info(`You may need to run "${lockfile.manualCommand}" manually`)
     }
   }
 

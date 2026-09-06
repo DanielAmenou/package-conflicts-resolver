@@ -465,3 +465,194 @@ describe("real git merge: package.json and package-lock.json together", () => {
     })
   })
 })
+
+/**
+ * Global-scope setup, verify and uninstall.
+ *
+ * `GIT_CONFIG_GLOBAL` (git 2.32+) redirects "--global" at a throwaway file, so
+ * these never touch the developer's or CI runner's real ~/.gitconfig.
+ */
+describe("global Git integration", () => {
+  interface GlobalRepo {
+    dir: string
+    globalConfig: string
+    cli(args: string[], stdin?: string): Promise<RunResult>
+    git(args: string[]): Promise<RunResult>
+    globalConfigContents(): Promise<string>
+  }
+
+  function runWithEnv(
+    command: string,
+    args: string[],
+    cwd: string,
+    env: NodeJS.ProcessEnv,
+    stdin?: string
+  ): Promise<RunResult> {
+    return new Promise((resolvePromise, reject) => {
+      const child = spawn(command, args, {
+        cwd,
+        env,
+        stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      })
+      let stdout = ""
+      let stderr = ""
+      child.stdout?.on("data", chunk => (stdout += chunk))
+      child.stderr?.on("data", chunk => (stderr += chunk))
+      child.on("error", reject)
+      child.on("close", code => resolvePromise({code, stdout, stderr}))
+      if (stdin !== undefined && child.stdin) {
+        child.stdin.write(stdin)
+        child.stdin.end()
+      }
+    })
+  }
+
+  async function withGlobalRepo<T>(fn: (repo: GlobalRepo) => Promise<T>): Promise<T> {
+    const dir = await mkdtemp(join(tmpdir(), "pcr-global-"))
+    const globalConfig = join(dir, "gitconfig-global")
+    await writeFile(globalConfig, "", "utf8")
+    const env = {...process.env, GIT_CONFIG_GLOBAL: globalConfig, HOME: dir}
+
+    await runWithEnv("git", ["init", "-b", "main"], dir, env)
+    await runWithEnv("git", ["config", "user.name", "Test"], dir, env)
+    await runWithEnv("git", ["config", "user.email", "test@example.com"], dir, env)
+
+    try {
+      return await fn({
+        dir,
+        globalConfig,
+        cli: (args, stdin) => runWithEnv(process.execPath, [CLI_PATH, ...args], dir, env, stdin),
+        git: args => runWithEnv("git", args, dir, env),
+        globalConfigContents: () => readFile(globalConfig, "utf8"),
+      })
+    } finally {
+      await rm(dir, {recursive: true, force: true})
+    }
+  }
+
+  test("the harness really isolates the global config", async () => {
+    await withGlobalRepo(async repo => {
+      // Guard against these tests silently writing to a real ~/.gitconfig
+      assert.equal((await repo.globalConfigContents()).trim(), "")
+      await repo.cli(["setup", "--global"])
+      assert.match(await repo.globalConfigContents(), /package-conflicts-resolver/)
+    })
+  })
+
+  test("setup --global configures the driver and does not write .gitattributes", async () => {
+    await withGlobalRepo(async repo => {
+      const result = await repo.cli(["setup", "--global"])
+      assert.equal(result.code, 0, result.stderr)
+      assert.match(result.stdout, /Git merge driver configured globally/)
+      assert.match(result.stdout, /you still need to add .gitattributes to each repository/)
+      for (const entry of EXPECTED_ENTRIES) {
+        assert(result.stdout.includes(entry), `should suggest: ${entry}`)
+      }
+
+      const config = await repo.globalConfigContents()
+      assert.match(config, /merge-driver %A %O %B/)
+
+      await assert.rejects(readFile(join(repo.dir, ".gitattributes"), "utf8"), "global setup must not touch the repo")
+    })
+  })
+
+  test("verify finds a global-only configuration and says so", async () => {
+    await withGlobalRepo(async repo => {
+      await repo.cli(["setup", "--global"])
+      await writeFile(join(repo.dir, ".gitattributes"), EXPECTED_ENTRIES.join("\n") + "\n")
+
+      const result = await repo.cli(["verify"])
+      assert.equal(result.code, 0, result.stderr)
+      assert.match(result.stdout, /Git merge driver is configured \(global\)/)
+      assert.match(result.stdout, /Global config affects all repositories/)
+      assert.match(result.stdout, /All checks passed/)
+    })
+  })
+
+  test("verify flags a global driver pointing at something else", async () => {
+    await withGlobalRepo(async repo => {
+      await repo.git(["config", "--global", "merge.package-conflicts-resolver.driver", "some-other-tool %A"])
+      await writeFile(join(repo.dir, ".gitattributes"), EXPECTED_ENTRIES.join("\n") + "\n")
+
+      const result = await repo.cli(["verify"])
+      assert.equal(result.code, 1)
+      assert.match(result.stdout, /configured \(global\) but may be incorrect/)
+    })
+  })
+
+  test("a local uninstall reports that only the global config exists", async () => {
+    await withGlobalRepo(async repo => {
+      await repo.cli(["setup", "--global"])
+
+      const result = await repo.cli(["uninstall", "--force"])
+      assert.equal(result.code, 0, result.stderr)
+      assert.match(result.stdout, /Only global configuration found/)
+      assert.match(await repo.globalConfigContents(), /package-conflicts-resolver/, "global config must survive")
+    })
+  })
+
+  test("uninstall --global removes the driver and leaves the local repo alone", async () => {
+    await withGlobalRepo(async repo => {
+      await repo.cli(["setup", "--global"])
+      await repo.cli(["setup"]) // also configure locally, with .gitattributes
+
+      const result = await repo.cli(["uninstall", "--global", "--force"])
+      assert.equal(result.code, 0, result.stderr)
+      assert.match(result.stdout, /This will remove the global Git configuration/)
+      assert.doesNotMatch(await repo.globalConfigContents(), /package-conflicts-resolver/)
+
+      // The local setup is untouched: config and .gitattributes both remain
+      const local = await repo.git(["config", "--local", "merge.package-conflicts-resolver.driver"])
+      assert.equal(local.code, 0)
+      assert.match(await readFile(join(repo.dir, ".gitattributes"), "utf8"), /package-conflicts-resolver/)
+    })
+  })
+
+  test("setup --global is idempotent", async () => {
+    await withGlobalRepo(async repo => {
+      await repo.cli(["setup", "--global"])
+      const first = await repo.globalConfigContents()
+
+      const second = await repo.cli(["setup", "--global"])
+      assert.equal(second.code, 0, second.stderr)
+      assert.equal(await repo.globalConfigContents(), first, "a second run must not duplicate entries")
+    })
+  })
+
+  test("a global driver actually resolves a merge in a repository with no local config", async () => {
+    await withGlobalRepo(async repo => {
+      // Point the global driver at this build rather than the published npx package
+      await repo.git([
+        "config",
+        "--global",
+        "merge.package-conflicts-resolver.driver",
+        `"${process.execPath}" "${CLI_PATH}" merge-driver %A %O %B`,
+      ])
+      await writeFile(join(repo.dir, ".gitattributes"), "package.json merge=package-conflicts-resolver\n")
+
+      const pkg = (version: string, deps: Record<string, string>) =>
+        JSON.stringify({name: "app", version, dependencies: deps}, null, 2) + "\n"
+
+      await writeFile(join(repo.dir, "package.json"), pkg("1.0.0", {lodash: "^4.17.20"}))
+      await repo.git(["add", "-A"])
+      await repo.git(["commit", "-m", "base"])
+
+      await repo.git(["checkout", "-b", "feature"])
+      await writeFile(join(repo.dir, "package.json"), pkg("1.2.0", {lodash: "^4.17.20", react: "^18.0.0"}))
+      await repo.git(["add", "-A"])
+      await repo.git(["commit", "-m", "feature"])
+
+      await repo.git(["checkout", "main"])
+      await writeFile(join(repo.dir, "package.json"), pkg("1.1.0", {lodash: "^4.17.21"}))
+      await repo.git(["add", "-A"])
+      await repo.git(["commit", "-m", "main"])
+
+      const merge = await repo.git(["merge", "feature"])
+      assert.equal(merge.code, 0, `${merge.stdout}\n${merge.stderr}`)
+
+      const merged = JSON.parse(await readFile(join(repo.dir, "package.json"), "utf8"))
+      assert.equal(merged.version, "1.2.0")
+      assert.deepEqual(merged.dependencies, {lodash: "^4.17.21", react: "^18.0.0"})
+    })
+  })
+})

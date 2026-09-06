@@ -280,3 +280,70 @@ describe("formatLockfileIssues", () => {
     assert.equal(formatLockfileIssues(issues.slice(0, 2)).length, 2)
   })
 })
+
+describe("validateLockfile robustness", () => {
+  test("entries without a usable version are skipped rather than reported", () => {
+    const doc = lock(
+      {dependencies: {a: "^1.0.0", b: "^1.0.0", c: "^1.0.0"}},
+      {
+        "node_modules/a": {resolved: "https://r/a.tgz"}, // no version at all
+        "node_modules/b": {version: "not-a-version", resolved: "https://r/b.tgz"},
+        "node_modules/c": {version: 42 as any},
+      }
+    )
+    assert.deepEqual(validateLockfile(doc), [])
+  })
+
+  test("survives malformed documents without throwing", () => {
+    const malformed: any[] = [
+      {lockfileVersion: 3, packages: null},
+      {lockfileVersion: 3, packages: {"": null}},
+      {lockfileVersion: 3, packages: {"": {dependencies: null}}},
+      {lockfileVersion: 3, packages: {"": {dependencies: {a: 42}}}},
+      {lockfileVersion: 3, packages: {"": {dependencies: {a: "^1.0.0"}}, "node_modules/a": "string"}},
+      {lockfileVersion: 3, packages: {"node_modules/a": {version: "1.0.0", dependencies: "nope"}}},
+      {lockfileVersion: 3, packages: {"node_modules/a": {link: true}}},
+      {lockfileVersion: 3, packages: {"node_modules/a": {link: true, resolved: "missing/target"}}},
+    ]
+
+    for (const doc of malformed) {
+      assert.doesNotThrow(() => validateLockfile(doc), `threw for ${JSON.stringify(doc)}`)
+      assert(Array.isArray(validateLockfile(doc)))
+    }
+  })
+
+  test("a link pointing at a missing target is not reported as a version mismatch", () => {
+    const doc = lock(
+      {dependencies: {"@app/core": "^1.0.0"}},
+      {"node_modules/@app/core": {resolved: "packages/core", link: true}}
+    )
+    // The target folder is absent from the lockfile: nothing to compare, and
+    // inventing a mismatch here would be worse than staying quiet
+    assert.deepEqual(validateLockfile(doc), [])
+  })
+
+  test("does not follow a link into an infinite loop", () => {
+    const doc = {
+      lockfileVersion: 3,
+      packages: {
+        "": {name: "app", dependencies: {a: "^1.0.0"}},
+        "node_modules/a": {resolved: "node_modules/a", link: true},
+      },
+    }
+    assert.doesNotThrow(() => validateLockfile(doc))
+  })
+
+  test("a very deep tree resolves without blowing the stack", () => {
+    const packages: Record<string, any> = {"": {name: "app", dependencies: {p0: "^1.0.0"}}}
+    let path = "node_modules/p0"
+    for (let i = 0; i < 400; i++) {
+      packages[path] = {version: "1.0.0", integrity: "sha512-x", dependencies: {[`p${i + 1}`]: "^1.0.0"}}
+      path = `${path}/node_modules/p${i + 1}`
+    }
+    packages[path] = {version: "1.0.0", integrity: "sha512-x"}
+
+    const doc = {lockfileVersion: 3, packages}
+    assert.doesNotThrow(() => validateLockfile(doc))
+    assert.deepEqual(validateLockfile(doc), [])
+  })
+})

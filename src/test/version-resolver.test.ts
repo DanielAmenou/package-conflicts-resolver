@@ -259,3 +259,71 @@ describe("stable-over-pre-release applies to ranges too", () => {
     assert.equal(VersionResolver.resolveVersion("^1.0.0-alpha.1", "^1.0.0", "lowest").resolved, "^1.0.0-alpha.1")
   })
 })
+
+describe("tie-breaks between ranges with the same minimum", () => {
+  test("highest prefers the more specific spec", () => {
+    // Same minimum version (1.2.3), different range shapes
+    assert.equal(VersionResolver.resolveVersion("~1.2.3", "^1.2.3", "highest").resolved, "~1.2.3")
+    assert.equal(VersionResolver.resolveVersion("^1.2.3", "~1.2.3", "highest").resolved, "~1.2.3")
+    assert.equal(VersionResolver.resolveVersion("^1.2.3", ">=1.2.3", "highest").resolved, "^1.2.3")
+  })
+
+  test("highest keeps ours when specificity is equal", () => {
+    const result = VersionResolver.resolveVersion(">=1.2.3", ">= 1.2.3", "highest")
+    assert.equal(result.resolved, ">=1.2.3")
+    assert.match(result.reason, /equal specificity|more specific/)
+  })
+
+  test("lowest prefers the more restrictive spec", () => {
+    assert.equal(VersionResolver.resolveVersion("^1.2.3", "~1.2.3", "lowest").resolved, "~1.2.3")
+    assert.equal(VersionResolver.resolveVersion("~1.2.3", "^1.2.3", "lowest").resolved, "~1.2.3")
+    assert.equal(VersionResolver.resolveVersion("^1.2.3", ">=1.2.3", "lowest").resolved, "^1.2.3")
+  })
+
+  test("lowest keeps ours when restrictiveness is equal", () => {
+    const result = VersionResolver.resolveVersion("^1.2.3", "^1.2.3 ", "lowest")
+    assert.equal(result.resolved, "^1.2.3")
+  })
+
+  test("every strategy returns one of the two inputs verbatim", () => {
+    const specs = ["1.2.3", "^1.2.3", "~1.2.3", ">=1.2.3", "1.x", "*", "2.0.0-beta.1", "workspace:*", "latest", ""]
+
+    for (const ours of specs) {
+      for (const theirs of specs) {
+        for (const strategy of ["highest", "lowest", "ours", "theirs"] as const) {
+          const {resolved} = VersionResolver.resolveVersion(ours, theirs, strategy)
+          assert(resolved === ours || resolved === theirs, `${strategy}("${ours}", "${theirs}") invented "${resolved}"`)
+        }
+      }
+    }
+  })
+
+  test("ours and theirs strategies are exact mirrors of each other", () => {
+    const specs = ["1.2.3", "^2.0.0", "workspace:*", "file:../x", "latest"]
+
+    for (const ours of specs) {
+      for (const theirs of specs) {
+        assert.equal(VersionResolver.resolveVersion(ours, theirs, "ours").resolved, ours)
+        assert.equal(VersionResolver.resolveVersion(ours, theirs, "theirs").resolved, theirs)
+      }
+    }
+  })
+
+  test("highest and lowest agree on which side is which", () => {
+    // For comparable specs, the two strategies must pick opposite sides
+    const comparable: [string, string][] = [
+      ["1.0.0", "2.0.0"],
+      ["^1.0.0", "^2.0.0"],
+      ["1.x", "2.x"],
+      ["1.9.0", "1.10.0"],
+    ]
+
+    for (const [ours, theirs] of comparable) {
+      const highest = VersionResolver.resolveVersion(ours, theirs, "highest").resolved
+      const lowest = VersionResolver.resolveVersion(ours, theirs, "lowest").resolved
+      assert.notEqual(highest, lowest, `"${ours}" vs "${theirs}" should split`)
+      assert.equal(highest, theirs)
+      assert.equal(lowest, ours)
+    }
+  })
+})

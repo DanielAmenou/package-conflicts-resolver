@@ -15,7 +15,12 @@
  * still throws the original SyntaxError.
  */
 
-const MAX_REPAIRS = 200
+/**
+ * Upper bound on inserted commas. Each repair re-parses the document, so this
+ * caps the work for a pathological file; a real merge needs at most one comma
+ * per conflict region.
+ */
+const MAX_REPAIRS = 1000
 
 /**
  * Parse JSON, repairing comma artifacts left behind by a line-based merge.
@@ -45,8 +50,14 @@ export function parseJsonLenient(text: string): any {
 
 /**
  * Remove commas that directly precede a closing `}` or `]` (ignoring
- * whitespace). Such a comma is never valid JSON, so dropping it is always safe.
- * String contents are skipped so a script like `x({a:1,})` is left alone.
+ * whitespace) *and* that follow a value. Such a comma is never valid JSON, so
+ * dropping it cannot change what the document means.
+ *
+ * A comma that follows an opening bracket or another comma is left alone: in
+ * `[,]` or `{"a": 1,,}` an element is genuinely missing, and guessing which
+ * one would invent data rather than repair a merge artifact.
+ *
+ * String contents are skipped, so a script like `x({a:1,})` is untouched.
  */
 export function stripTrailingCommas(text: string): string {
   let result = ""
@@ -78,7 +89,11 @@ export function stripTrailingCommas(text: string): string {
         next++
       }
       const following = text[next]
-      if (following === "}" || following === "]") {
+      // Only drop it when a value actually precedes the comma
+      const preceding = result.replace(/\s+$/, "").slice(-1)
+      const followsValue = preceding !== "" && preceding !== "[" && preceding !== "{" && preceding !== ","
+
+      if ((following === "}" || following === "]") && followsValue) {
         continue // drop the trailing comma
       }
     }
