@@ -163,3 +163,85 @@ describe("Logger", () => {
     assert.deepEqual(capture(() => new Logger(QUIET).summary(1, 1, false)).logs, [])
   })
 })
+
+describe("Logger attached data", () => {
+  test("info, success and warn print attached data only when verbose", () => {
+    const verbose = capture(() => {
+      const logger = new Logger(VERBOSE)
+      logger.info("info", {a: 1})
+      logger.success("success", {b: 2})
+      logger.warn("warn", {c: 3})
+    })
+
+    assert(verbose.logs.some(line => line.includes('"a": 1')))
+    assert(verbose.logs.some(line => line.includes('"b": 2')))
+    assert(verbose.warns.some(line => line.includes('"c": 3')))
+
+    const terse = capture(() => {
+      const logger = new Logger(HUMAN)
+      logger.info("info", {a: 1})
+      logger.success("success", {b: 2})
+      logger.warn("warn", {c: 3})
+    })
+
+    assert(!terse.logs.some(line => line.includes('"a": 1')), "data is hidden without --verbose")
+    assert(!terse.logs.some(line => line.includes('"b": 2')))
+    assert(!terse.warns.some(line => line.includes('"c": 3')))
+    // The messages themselves are still shown
+    assert(terse.logs.some(line => line.includes("info")))
+    assert(terse.warns.some(line => line.includes("warn")))
+  })
+
+  test("errors always print their data, verbose or not", () => {
+    const captured = capture(() => new Logger(QUIET).error("boom", {detail: "why"}))
+
+    assert(captured.errors.some(line => line.includes("boom")))
+    assert(captured.errors.some(line => line.includes('"detail": "why"')))
+  })
+
+  test("data survives the round trip in json mode", () => {
+    const captured = capture(() => new Logger(JSON_MODE).info("with data", {nested: {list: [1, 2]}}))
+
+    const parsed = JSON.parse(captured.logs[0]!)
+    assert.deepEqual(parsed.data, {nested: {list: [1, 2]}})
+    assert.equal(parsed.level, "info")
+    assert.match(parsed.timestamp, /^\d{4}-\d{2}-\d{2}T/)
+  })
+
+  test("every json-mode line is independently parseable", () => {
+    const captured = capture(() => {
+      const logger = new Logger({quiet: false, json: true, verbose: true})
+      logger.info("one")
+      logger.success("two", {x: 1})
+      logger.debug("three", {y: 2})
+      logger.logConflicts([CONFLICT])
+      logger.summary(1, 2, false)
+    })
+
+    assert.equal(captured.logs.length, 5)
+    for (const line of captured.logs) {
+      assert.doesNotThrow(() => JSON.parse(line), `not valid JSON: ${line}`)
+    }
+  })
+
+  test("a message containing newlines and quotes stays on one json record", () => {
+    const message = 'a "quoted"\nmulti-line\tmessage'
+    const captured = capture(() => new Logger(JSON_MODE).info(message))
+
+    assert.equal(captured.logs.length, 1)
+    assert.equal(captured.logs[0]!.split("\n").length, 1, "an embedded newline must be escaped, not literal")
+    assert.equal(JSON.parse(captured.logs[0]!).message, message)
+  })
+
+  test("conflict records with unusual values still serialize", () => {
+    const captured = capture(() => {
+      new Logger(JSON_MODE).logConflicts([
+        {field: "a.b", ourValue: "<deleted>", theirValue: '{"json":"inside"}', resolvedValue: "", strategy: "ours"},
+      ])
+    })
+
+    const parsed = JSON.parse(captured.logs[0]!)
+    assert.equal(parsed.data.conflicts[0].theirValue, '{"json":"inside"}')
+    assert.equal(parsed.data.conflicts[0].resolvedValue, "")
+  })
+})

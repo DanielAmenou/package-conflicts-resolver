@@ -16,8 +16,8 @@ interface MergeOutcome {
 }
 
 /**
- * Object fields whose string values are version specs and must be compared
- * with semver rather than lexicographically.
+ * Object fields whose immediate string values are version specs and must be
+ * compared with semver rather than lexicographically.
  */
 const VERSION_SPEC_PARENT_FIELDS = new Set([
   "dependencies",
@@ -30,6 +30,16 @@ const VERSION_SPEC_PARENT_FIELDS = new Set([
   "overrides",
   "resolutions",
 ])
+
+/**
+ * Fields whose whole subtree holds version specs, however deeply nested.
+ * npm's `overrides` and yarn's `resolutions` nest arbitrarily:
+ *
+ *   "overrides": {"foo": {".": "1.2.0", "bar": "1.2.0"}}
+ *
+ * so every string leaf below them is a spec, not free-form text.
+ */
+const VERSION_SPEC_SUBTREE_FIELDS = new Set(["overrides", "resolutions"])
 
 /**
  * Fields of a package-lock entry that identify the exact artifact it points
@@ -935,11 +945,18 @@ export class PackageResolver {
     const currentKey = path[path.length - 1]
     const parentKey = path[path.length - 2]
 
-    return (
-      currentKey === "version" ||
-      currentKey === "packageManager" ||
-      (parentKey !== undefined && VERSION_SPEC_PARENT_FIELDS.has(parentKey))
-    )
+    if (currentKey === "version" || currentKey === "packageManager") {
+      return true
+    }
+
+    if (parentKey !== undefined && VERSION_SPEC_PARENT_FIELDS.has(parentKey)) {
+      return true
+    }
+
+    // Anywhere inside an overrides/resolutions subtree. The current key itself
+    // is excluded so a field that merely shares the name (a script called
+    // "overrides", say) is not mistaken for a spec.
+    return path.slice(0, -1).some(segment => VERSION_SPEC_SUBTREE_FIELDS.has(segment))
   }
 
   private stringifyConflictValue(value: any): string {
