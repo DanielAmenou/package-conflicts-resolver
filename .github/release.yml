@@ -1,0 +1,49 @@
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+    authors:
+      - dependabot
+      - dependabot[bot]
+  categories:
+    - title: 🚀 Features
+      labels:
+        - enhancement
+        - feature
+        - Semver-Minor
+    - title: 🐛 Bug Fixes
+      labels:
+        - bug
+        - fix
+        - Semver-Patch
+    - title: ⚡ Performance Improvements
+      labels:
+        - performance
+    - title: ♻️ Code Refactoring
+      labels:
+        - refactor
+    - title: 📝 Documentation
+      labels:
+        - documentation
+        - docs
+    - title: 🧪 Tests
+      labels:
+        - test
+        - tests
+    - title: 🏗️ Build System & CI
+      labels:
+        - build
+        - ci
+    - title: 🎨 Style Changes
+      labels:
+        - style
+    - title: 🔧 Chores
+      labels:
+        - chore
+        - maintenance
+    - title: ⏪ Reverts
+      labels:
+        - revert
+    - title: Other Changes
+      labels:
+        - "*"

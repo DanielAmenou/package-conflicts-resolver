@@ -1,0 +1,56 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` publishes that version to npm and creates the GitHub release. Create tags with the
+# release scripts (`npm run release:patch | release:minor | release:major | release:next`), not by hand.
+# Stable versions must be tagged on `main` and go to the `latest` dist-tag; prereleases (`v2.0.0-next.0`) must be
+# tagged on another branch and go to the `next` dist-tag. The job refuses a tag on the wrong branch.
+#
+# Authentication is npm "trusted publishing" (OIDC): no npm token is stored in the repository.
+# One-time setup on npmjs.com → package "package-conflicts-resolver" → Settings → Trusted publisher → GitHub Actions:
+#   organization/user: DanielAmenou · repository: package-conflicts-resolver · workflow filename: release.yml · environment: (empty)
+#   and tick "Allow npm publish" (setups created after 3 Sep 2026 allow only `npm stage publish` by default).
+# Trusted publishing needs npm >= 11.5.1, so the job upgrades npm before publishing.
+# Provenance attestations are generated automatically for a public repository.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - name: The tag must match package.json (the dist-tag is derived from the tag, the version from package.json)
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - name: Stable versions are released from main, prereleases from any other branch
+        run: |
+          on_main=no
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main && on_main=yes
+          case "$GITHUB_REF_NAME" in
+            *-*) [ "$on_main" = no ] || { echo "::error::$GITHUB_REF_NAME is a prerelease: release it from a branch other than main"; exit 1; } ;;
+            *) [ "$on_main" = yes ] || { echo "::error::$GITHUB_REF_NAME is a stable version: release it from main"; exit 1; } ;;
+          esac
+      - run: npm run build && npm test
+      - name: Publish to npm (trusted publishing, with provenance)
+        run: npm publish --provenance --access public ${{ contains(github.ref_name, '-') && '--tag next' || '' }}
+      - name: Create the GitHub release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace("refs/tags/", "");
+            const { data: notes } = await github.rest.repos.generateReleaseNotes({ owner: context.repo.owner, repo: context.repo.repo, tag_name: tag, target_commitish: context.sha });
+            await github.rest.repos.createRelease({ owner: context.repo.owner, repo: context.repo.repo, tag_name: tag, name: tag, body: notes.body, prerelease: tag.includes("-") });
