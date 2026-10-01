@@ -85,7 +85,7 @@ async function main() {
       "highest"
     )
     .option("-d, --dry-run", "Show what would be done without making changes", false)
-    .option("-q, --quiet", "Suppress output except errors", false)
+    .option("-q, --quiet", "Suppress output except warnings and errors", false)
     .option("-j, --json", "Output in JSON format", false)
     .option("-v, --verbose", "Enable verbose logging", false)
     .option("--no-regenerate-lock", "Skip package-lock.json regeneration")
@@ -945,10 +945,22 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
     })
 
     const answer = await new Promise<string>(resolve => {
+      let settled = false
+      const settle = (value: string) => {
+        if (settled) return
+        settled = true
+        resolve(value)
+      }
       rl.question("", answer => {
+        // settle before close(): rl.close() fires the "close" listener
+        // synchronously, and the answer must win that race
+        settle(answer.toLowerCase())
         rl.close()
-        resolve(answer.toLowerCase())
       })
+      // stdin may end without an answer (hooks, CI): treat EOF as "no" so the
+      // command cannot hang waiting for input that will never come. A real
+      // answer settles first, so this only fires when none was given.
+      rl.on("close", () => settle(""))
     })
 
     if (!["y", "yes"].includes(answer)) {
