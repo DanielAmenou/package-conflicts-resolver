@@ -21,6 +21,10 @@ const CLI_PATH = join(__dirname, "..", "cli.js")
 const SKIP_AS_ROOT =
   typeof process.getuid === "function" && process.getuid() === 0 ? "permission checks are meaningless as root" : false
 
+// Windows ignores the POSIX read bit, so chmod(0o000) leaves the file readable: the unreadable-file case cannot be simulated there.
+const SKIP_UNREADABLE =
+  process.platform === "win32" ? "file read permissions cannot be removed on Windows" : SKIP_AS_ROOT
+
 function makeResolver(strategy: CliOptions["strategy"] = "highest"): PackageResolver {
   return new PackageResolver({strategy, dryRun: true, quiet: true, json: false, verbose: false, regenerateLock: false})
 }
@@ -244,7 +248,7 @@ describe("I/O and argument failures", () => {
     })
   })
 
-  test("an unreadable file fails cleanly", {skip: SKIP_AS_ROOT}, async () => {
+  test("an unreadable file fails cleanly", {skip: SKIP_UNREADABLE}, async () => {
     await withTempDir(async dir => {
       const file = join(dir, "package.json")
       await writeFile(file, '{"name": "app"}', "utf8")

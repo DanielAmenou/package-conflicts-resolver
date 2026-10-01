@@ -81,7 +81,7 @@ describe("CLI Integration Tests", () => {
       await writeFile(join(repoDir, ".gitattributes"), "package.json merge=package-conflicts-resolver\n")
       await runCommand(
         "git",
-        ["config", "merge.package-conflicts-resolver.driver", `node ${cliPath} merge-driver %A %O %B`],
+        ["config", "merge.package-conflicts-resolver.driver", `node "${cliPath}" merge-driver %A %O %B`],
         repoDir
       )
     }
