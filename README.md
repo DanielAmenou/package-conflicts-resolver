@@ -124,7 +124,7 @@ npx package-conflicts-resolver verify           # Verify Git integration is work
 ```bash
 -s, --strategy <strategy>     Resolution strategy (highest, lowest, ours, theirs)
 -d, --dry-run                 Show what would be done without making changes
--q, --quiet                   Suppress output except errors
+-q, --quiet                   Suppress output except warnings and errors
 -j, --json                    Output in JSON format
 -v, --verbose                 Enable verbose logging
 --no-regenerate-lock          Skip package-lock.json regeneration
