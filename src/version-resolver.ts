@@ -315,9 +315,10 @@ export class VersionResolver {
             : {resolved: theirValue, reason: `their value is numerically ${strategy}`}
         }
 
-        // For strings, fall back to lexicographic comparison
+        // For strings, fall back to lexicographic comparison by code unit,
+        // so the outcome does not depend on the machine's locale settings
         if (typeof ourValue === "string" && typeof theirValue === "string") {
-          const comparison = ourValue.localeCompare(theirValue)
+          const comparison = ourValue < theirValue ? -1 : ourValue > theirValue ? 1 : 0
           const preferOurs = strategy === "highest" ? comparison > 0 : comparison < 0
           return preferOurs
             ? {resolved: ourValue, reason: `our value is lexicographically ${strategy}`}
