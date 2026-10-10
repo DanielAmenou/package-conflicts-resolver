@@ -13,14 +13,21 @@
  * Neither can change the meaning of an existing token, string contents are
  * never touched, and the result is only accepted when it parses. Anything else
  * still throws the original SyntaxError.
+ *
+ * Both repairs are made in a single pass over the text, so the work grows
+ * linearly with the size of the document however many commas need fixing
+ * (lockfiles run to several megabytes). The pass reads the text itself, not
+ * the parser's error messages, which every JavaScript engine words its own way.
  */
 
-/**
- * Upper bound on inserted commas. Each repair re-parses the document, so this
- * caps the work for a pathological file; a real merge needs at most one comma
- * per conflict region.
- */
-const MAX_REPAIRS = 1000
+/** JavaScript's whitespace: JSON's own, and anything else a merge could leave around it */
+const WHITESPACE = /\s/
+
+/** JSON's punctuation, which ends a bare token (a number, true, false or null) */
+const DELIMITERS = new Set(['"', "{", "}", "[", "]", ",", ":"])
+
+/** A complete JSON number */
+const NUMBER = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/
 
 /**
  * Parse JSON, repairing comma artifacts left behind by a line-based merge.
@@ -30,22 +37,34 @@ export function parseJsonLenient(text: string): any {
   try {
     return JSON.parse(text)
   } catch (originalError) {
-    let current = stripTrailingCommas(text)
-
-    for (let attempt = 0; attempt < MAX_REPAIRS; attempt++) {
+    const repaired = repairCommas(text)
+    if (repaired !== text) {
       try {
-        return JSON.parse(current)
-      } catch (error) {
-        const repaired = insertMissingComma(current, error)
-        if (repaired === null) {
-          throw originalError
-        }
-        current = repaired
+        return JSON.parse(repaired)
+      } catch {
+        // More than commas is wrong: report the error of the text as it was given
       }
     }
-
     throw originalError
   }
+}
+
+/**
+ * Insert the commas missing between two values and remove trailing ones (see
+ * stripTrailingCommas), in one pass.
+ *
+ * A comma is inserted where one value ends and the next one starts with
+ * nothing but whitespace between them. A value ends with a string, a closing
+ * bracket, a number or true/false/null; one starts with a string, an opening
+ * bracket, a number or true/false/null. Valid JSON never has two values side
+ * by side, so no well-formed part of a document changes. The comma goes right
+ * after the first value, and the whitespace stays as it was.
+ *
+ * Tokens are never split: "01" or "truefalse" stay as they are, and still fail
+ * to parse, rather than becoming two values.
+ */
+export function repairCommas(text: string): string {
+  return repair(text, true)
 }
 
 /**
@@ -60,88 +79,110 @@ export function parseJsonLenient(text: string): any {
  * String contents are skipped, so a script like `x({a:1,})` is untouched.
  */
 export function stripTrailingCommas(text: string): string {
-  let result = ""
-  let inString = false
+  return repair(text, false)
+}
 
-  for (let i = 0; i < text.length; i++) {
+function repair(text: string, insertMissing: boolean): string {
+  // Unchanged stretches are copied in slices: the text before `copied` is already in `result`
+  let result = ""
+  let copied = 0
+  // The last character kept outside whitespace ("" before the first one): what a comma follows
+  let lastSignificant = ""
+  // Where the last value read ends, or -1 when the last token did not end a value
+  let valueEnd = -1
+
+  // A value starts here: when another one ended just before it, the comma between them is missing
+  const startValue = () => {
+    if (insertMissing && valueEnd !== -1) {
+      result += `${text.slice(copied, valueEnd)},`
+      copied = valueEnd
+    }
+  }
+
+  let i = 0
+  while (i < text.length) {
     const char = text[i] as string
 
-    if (inString) {
-      result += char
-      if (char === "\\" && i + 1 < text.length) {
-        result += text[i + 1]
-        i++
-      } else if (char === '"') {
-        inString = false
-      }
+    if (WHITESPACE.test(char)) {
+      i++
       continue
     }
 
     if (char === '"') {
-      inString = true
-      result += char
-      continue
+      startValue()
+      i = endOfString(text, i)
+      valueEnd = i
+    } else if (char === "{" || char === "[") {
+      startValue()
+      i++
+      valueEnd = -1
+    } else if (char === "}" || char === "]") {
+      i++
+      valueEnd = i
+    } else if (char === "," || char === ":") {
+      i++
+      valueEnd = -1
+      if (char === "," && isTrailingComma(text, i, lastSignificant)) {
+        result += text.slice(copied, i - 1)
+        copied = i
+        continue // the comma is gone, so it is not what the next one follows
+      }
+    } else {
+      // A bare token: a number, true, false, null, or something that is not JSON at all
+      const end = endOfBareToken(text, i)
+      if (isValue(text.slice(i, end))) {
+        startValue()
+        valueEnd = end
+      } else {
+        valueEnd = -1
+      }
+      i = end
     }
 
-    if (char === ",") {
-      let next = i + 1
-      while (next < text.length && /\s/.test(text[next] as string)) {
-        next++
-      }
-      const following = text[next]
-      // Only drop it when a value actually precedes the comma
-      const preceding = result.replace(/\s+$/, "").slice(-1)
-      const followsValue = preceding !== "" && preceding !== "[" && preceding !== "{" && preceding !== ","
-
-      if ((following === "}" || following === "]") && followsValue) {
-        continue // drop the trailing comma
-      }
-    }
-
-    result += char
+    lastSignificant = text[i - 1] as string
   }
 
-  return result
+  return result + text.slice(copied)
 }
 
 /**
- * Insert the comma the parser expected at the reported error position, but
- * only when the position sits between the end of one value and the start of
- * the next. Returns null when the error is anything else.
+ * Whether the comma just before `next` directly precedes a closing bracket
+ * and follows a value: after "[", "{", "," or at the start, an element is
+ * genuinely missing instead.
  */
-function insertMissingComma(text: string, error: unknown): string | null {
-  const message = error instanceof Error ? error.message : String(error)
-
-  // V8 (Node 20+): "Expected ',' or '}' after property value in JSON at position N"
-  // Older engines: "Unexpected string in JSON at position N"
-  if (!/Expected ',' or ['}\]]/.test(message) && !/^Unexpected (?:string|number)/.test(message)) {
-    return null
+function isTrailingComma(text: string, next: number, lastSignificant: string): boolean {
+  if (lastSignificant === "" || lastSignificant === "[" || lastSignificant === "{" || lastSignificant === ",") {
+    return false
   }
-
-  const positionMatch = message.match(/position (\d+)/)
-  if (!positionMatch || !positionMatch[1]) {
-    return null
+  while (next < text.length && WHITESPACE.test(text[next] as string)) {
+    next++
   }
+  return text[next] === "}" || text[next] === "]"
+}
 
-  const position = parseInt(positionMatch[1], 10)
-  if (!(position > 0 && position < text.length)) {
-    return null
+/** The index just past the string that opens at `start` (the end of the text when it is never closed) */
+function endOfString(text: string, start: number): number {
+  for (let i = start + 1; i < text.length; i++) {
+    const char = text[i]
+    if (char === "\\") {
+      i++ // the escaped character, which may be a quote
+    } else if (char === '"') {
+      return i + 1
+    }
   }
+  return text.length
+}
 
-  const beforeWithWhitespace = text.slice(0, position)
-  const before = beforeWithWhitespace.replace(/\s+$/, "")
-  const whitespace = beforeWithWhitespace.slice(before.length)
-  const previous = before[before.length - 1]
-  const next = text[position]
-
-  // The previous character must end a value (string, object, array, number,
-  // true/false or null) and the next one must start a value or a key.
-  if (!previous || !/["}\]0-9el]/.test(previous)) {
-    return null
+/** The index just past the bare token that starts at `start`: it runs to whitespace or punctuation */
+function endOfBareToken(text: string, start: number): number {
+  let end = start + 1
+  while (end < text.length && !DELIMITERS.has(text[end] as string) && !WHITESPACE.test(text[end] as string)) {
+    end++
   }
-  if (!next || !/["{[0-9tfn-]/.test(next)) {
-    return null
-  }
+  return end
+}
 
-  return `${before},${whitespace}${text.slice(position)}`
+/** Whether a bare token is a whole JSON value: a number, true, false or null */
+function isValue(token: string): boolean {
+  return token === "true" || token === "false" || token === "null" || NUMBER.test(token)
 }
