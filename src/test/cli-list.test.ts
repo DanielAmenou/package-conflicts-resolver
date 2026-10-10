@@ -8,7 +8,7 @@ import {strict as assert} from "assert"
 import {test, describe, before, after} from "node:test"
 import {readFile, writeFile} from "fs/promises"
 import {join} from "node:path"
-import {conflictedDocument, jsonLines, runCli, withTempDir} from "./cli-harness.js"
+import {conflictedDocument, jsonLines, runCli, runCliWithSlowReader, withTempDir} from "./cli-harness.js"
 import {FakeRegistry, startFakeRegistry} from "./fake-registry.js"
 
 const OURS = {
@@ -121,6 +121,23 @@ describe("--list", () => {
       assert.deepEqual(report.files[0].otherConflicts, [
         {field: "version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"},
       ])
+    })
+  })
+
+  test("--json prints a report larger than a pipe buffer in full", async () => {
+    await withTempDir(async dir => {
+      // About 500 KB, far more than a pipe holds (64 KB): with a slow reader the
+      // end of the report is still queued when the command finishes
+      const names = Array.from({length: 3000}, (_, index) => `package-${index}`)
+      const dependencies = (major: number) => Object.fromEntries(names.map(name => [name, `^${major}.0.0`]))
+      await setUp(dir, {
+        "package.json": conflictedDocument({dependencies: dependencies(1)}, {dependencies: dependencies(2)}),
+      })
+
+      const result = await runCliWithSlowReader(["--list", "--json"], dir, 1500, registry.npmEnv)
+      assert.equal(result.code, 0, result.stderr)
+      const [report] = jsonLines(result.stdout)
+      assert.equal(report.files[0].packages.length, names.length)
     })
   })
 

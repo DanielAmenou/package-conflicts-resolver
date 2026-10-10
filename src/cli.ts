@@ -72,12 +72,39 @@ function formatCommand(cmd: {command: string; args: string[]}): string {
 /**
  * Run a lockfile command (e.g. "npm install --package-lock-only").
  * Resolves to false when the command fails or is not installed.
+ *
+ * When `quiet`, the command's output is discarded. It must never be piped
+ * without being read: a pipe holds about 64 KB, and a package manager that
+ * prints more (a verbose loglevel, a long ERESOLVE report, many deprecation
+ * warnings) would block on the full pipe forever, and this command with it.
  */
 function runLockfileCommand(cmd: {command: string; args: string[]}, cwd: string, quiet: boolean): Promise<boolean> {
   return new Promise(resolvePromise => {
-    const child = spawnCommand(cmd.command, cmd.args, {stdio: quiet ? "pipe" : "inherit", cwd})
+    const child = spawnCommand(cmd.command, cmd.args, {stdio: quiet ? "ignore" : "inherit", cwd})
     child.on("close", code => resolvePromise(code === 0))
     child.on("error", () => resolvePromise(false))
+  })
+}
+
+/**
+ * Exit with `code` once everything written to stdout and stderr is flushed.
+ *
+ * process.exit() alone drops output that is still queued: on POSIX, writes to
+ * a pipe are asynchronous, so whatever did not fit in the pipe buffer (64 KB)
+ * is lost, cutting a large `--list --json` report short on its way to `jq` or
+ * a CI log. The returned promise never settles: callers `return` it.
+ */
+async function flushAndExit(code: number): Promise<never> {
+  await Promise.all([flushStream(process.stdout), flushStream(process.stderr)])
+  process.exit(code)
+}
+
+/** Resolve once a stream has written out everything queued so far, or failed (its reader went away) */
+function flushStream(stream: NodeJS.WriteStream): Promise<void> {
+  return new Promise(resolve => {
+    stream.once("error", () => resolve())
+    // Writes complete in order, so the callback of an empty write runs after every earlier one
+    stream.write("", () => resolve())
   })
 }
 
@@ -125,7 +152,7 @@ async function main() {
       if (!Object.keys(RESOLUTION_STRATEGIES).includes(cliOptions.strategy)) {
         console.error(`❌ Invalid strategy: ${cliOptions.strategy}`)
         console.error(`Available strategies: ${Object.keys(RESOLUTION_STRATEGIES).join(", ")}`)
-        process.exit(1)
+        return flushAndExit(1)
       }
 
       // Validate picked versions (their existence is checked once the conflicts are known)
@@ -134,7 +161,7 @@ async function main() {
         for (const error of errors) {
           console.error(`❌ Invalid --pick: ${error}`)
         }
-        process.exit(1)
+        return flushAndExit(1)
       }
       if (Object.keys(picks).length > 0) {
         cliOptions.picks = picks
@@ -144,7 +171,7 @@ async function main() {
         await resolvePackageConflicts(cliOptions)
       } catch (error) {
         console.error(`❌ Failed to resolve conflicts: ${error instanceof Error ? error.message : String(error)}`)
-        process.exit(1)
+        return flushAndExit(1)
       }
     })
 
@@ -211,20 +238,20 @@ async function main() {
             console.error(
               "package-conflicts-resolver: (add --allow-inconsistent-lockfile to the merge driver command to accept such merges)"
             )
-            process.exit(1)
+            return flushAndExit(1)
           }
 
-          process.exit(0) // Success
+          return flushAndExit(0) // Success
         } else {
           // Non-zero exit tells Git the file is still conflicted
           console.error(`package-conflicts-resolver: could not auto-resolve merge: ${result.errors.join(", ")}`)
-          process.exit(1)
+          return flushAndExit(1)
         }
       } catch (error) {
         console.error(
           `package-conflicts-resolver: merge driver failed: ${error instanceof Error ? error.message : String(error)}`
         )
-        process.exit(1) // Error
+        return flushAndExit(1) // Error
       }
     })
 
@@ -239,7 +266,7 @@ async function main() {
         await setupGitIntegration(options.global, options.skipGitattributes)
       } catch (error) {
         console.error(`❌ Failed to setup Git integration: ${error instanceof Error ? error.message : String(error)}`)
-        process.exit(1)
+        return flushAndExit(1)
       }
     })
 
@@ -252,7 +279,7 @@ async function main() {
         await verifySetup()
       } catch (error) {
         console.error(`❌ Verification failed: ${error instanceof Error ? error.message : String(error)}`)
-        process.exit(1)
+        return flushAndExit(1)
       }
     })
 
@@ -269,7 +296,7 @@ async function main() {
         console.error(
           `❌ Failed to uninstall Git integration: ${error instanceof Error ? error.message : String(error)}`
         )
-        process.exit(1)
+        return flushAndExit(1)
       }
     })
 
@@ -287,7 +314,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     await access(filePath)
   } catch {
     console.error(`❌ File not found: ${filePath}`)
-    process.exit(1)
+    return flushAndExit(1)
   }
 
   // Read file content
@@ -316,7 +343,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
 
     if (!result.resolved) {
       console.error(`❌ Failed to resolve conflicts: ${result.errors.join(", ")}`)
-      process.exit(1)
+      return flushAndExit(1)
     }
 
     if (result.packageJson) {
@@ -366,8 +393,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
         console.log(`   3. Ensure conflicts happen in package.json or package-lock.json`)
       }
     }
-    process.exit(0)
-    return
+    return flushAndExit(0)
   }
 
   // Regenerate lockfiles so they are consistent with the merged package.json
@@ -412,7 +438,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
   }
 
   const exitWithError = failed.length > 0 || (inconsistent.length > 0 && !options.dryRun)
-  process.exit(exitWithError ? 1 : 0)
+  return flushAndExit(exitWithError ? 1 : 0)
 }
 
 /**
@@ -441,14 +467,14 @@ async function checkBeforeResolving(filePath: string, content: string, options: 
     for (const error of check?.errors ?? []) {
       console.error(`❌ ${error}`)
     }
-    process.exit(failed || (check?.errors.length ?? 0) > 0 ? 1 : 0)
+    return flushAndExit(failed || (check?.errors.length ?? 0) > 0 ? 1 : 0)
   }
 
   // A target that cannot be resolved fails exactly like it does without picks
   const target = files.find(file => file.file === filePath)
   if (target !== undefined && !target.analyzed) {
     console.error(`❌ Failed to resolve conflicts: ${target.reason}`)
-    process.exit(1)
+    return flushAndExit(1)
   }
 
   const logger = new Logger({quiet: options.quiet, json: options.json, verbose: options.verbose})
@@ -462,7 +488,7 @@ async function checkBeforeResolving(filePath: string, content: string, options: 
       console.error(`❌ ${error}`)
     }
     console.error("   No file was changed.")
-    process.exit(1)
+    return flushAndExit(1)
   }
 
   for (const message of verified) {
@@ -1058,7 +1084,7 @@ async function verifySetup(): Promise<void> {
   if (hasErrors) {
     console.log("❌ Setup verification failed. Please fix the issues above.")
     console.log("\nTo fix, run: package-conflicts-resolver setup")
-    process.exit(1)
+    return flushAndExit(1)
   } else {
     console.log("✅ All checks passed! Git integration is set up correctly.")
     console.log("\nThe tool will now automatically resolve conflicts in package.json")
@@ -1227,7 +1253,7 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
   console.log()
   if (hasErrors) {
     console.log("❌ Uninstallation completed with errors. Some components may not have been removed.")
-    process.exit(1)
+    return flushAndExit(1)
   } else {
     console.log("✅ Git integration successfully uninstalled!")
     if (!global) {
@@ -1288,6 +1314,6 @@ process.on("uncaughtException", error => {
 if (require.main === module) {
   main().catch(error => {
     console.error("Fatal error:", error.message)
-    process.exit(1)
+    return flushAndExit(1)
   })
 }

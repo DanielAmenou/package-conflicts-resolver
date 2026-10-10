@@ -38,6 +38,35 @@ export function runCli(args: string[], cwd: string, env: Record<string, string> 
   return run(process.execPath, [CLI_PATH, ...args], cwd, env)
 }
 
+/**
+ * Run the CLI behind a slow reader that leaves its stdout unread for `delayMs`.
+ * The pipe fills up, so the end of a large output is still queued when the
+ * command finishes: a command that exits without flushing loses it.
+ */
+export function runCliWithSlowReader(
+  args: string[],
+  cwd: string,
+  delayMs: number,
+  env: Record<string, string> = {}
+): Promise<RunResult> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(process.execPath, [CLI_PATH, ...args], {
+      cwd,
+      env: {...process.env, ...env},
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+    let stdout = ""
+    let stderr = ""
+    // Paused before a listener is attached, so no data flows until resume()
+    child.stdout.pause()
+    child.stdout.on("data", chunk => (stdout += chunk))
+    setTimeout(() => child.stdout.resume(), delayMs)
+    child.stderr.on("data", chunk => (stderr += chunk))
+    child.on("error", reject)
+    child.on("close", code => resolvePromise({code, stdout, stderr}))
+  })
+}
+
 /** Run `fn` in a fresh temporary folder (its canonical path, so it compares with what child processes report) */
 export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "pcr-e2e-")))

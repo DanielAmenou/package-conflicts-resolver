@@ -33,7 +33,8 @@ interface Harness {
   dir: string
   /** Commands the stubs recorded, in order */
   invocations(): Promise<Invocations>
-  run(args: string[], env?: Record<string, string>, cwd?: string): Promise<CliResult>
+  /** Run the CLI; after `timeoutMs` it is killed, and its exit code is null */
+  run(args: string[], env?: Record<string, string>, cwd?: string, timeoutMs?: number): Promise<CliResult>
 }
 
 /**
@@ -88,12 +89,13 @@ async function withHarness<T>(
       const content = await readFile(log, "utf8")
       return content.split("\n").filter(line => line.trim() !== "")
     },
-    run(args, env = {}, cwd = dir) {
+    run(args, env = {}, cwd = dir, timeoutMs) {
       return new Promise((resolvePromise, reject) => {
         const child = spawn(process.execPath, [CLI_PATH, ...args], {
           cwd,
           stdio: ["ignore", "pipe", "pipe"],
           env: {...process.env, PATH: binDir, PCR_STUB_LOG: log, ...env},
+          timeout: timeoutMs,
         })
         let stdout = ""
         let stderr = ""
@@ -482,6 +484,48 @@ describe("output contracts during regeneration", {skip: SKIP_ON_WINDOWS}, () => 
       for (const line of result.stdout.split("\n").filter(line => line.trim() !== "")) {
         assert.doesNotThrow(() => JSON.parse(line), `not valid JSON: ${line}`)
       }
+    })
+  })
+
+  test("--quiet and --json do not hang when the package manager prints more than a pipe holds", async () => {
+    await withHarness(async harness => {
+      // About 150 KB on stdout and on stderr, well over the 64 KB a pipe holds
+      // (shell builtins only: PATH holds nothing but the stubs)
+      const chattyNpm = join(harness.dir, "..", "bin", "npm")
+      await writeFile(
+        chattyNpm,
+        [
+          "#!/bin/sh",
+          "i=0",
+          'while [ "$i" -lt 2000 ]; do',
+          '  printf "npm warn deprecated package-%s@1.0.0: no longer supported, please upgrade\\n" "$i"',
+          '  printf "npm warn deprecated package-%s@1.0.0: no longer supported, please upgrade\\n" "$i" >&2',
+          "  i=$((i + 1))",
+          "done",
+          "exit 0",
+        ].join("\n"),
+        "utf8"
+      )
+      await chmod(chattyNpm, 0o755)
+      const conflictedProject = async () => {
+        await writeFile(join(harness.dir, "package.json"), CONFLICTED_PACKAGE_JSON, "utf8")
+        await writeFile(join(harness.dir, "package-lock.json"), lock({foo: "^1.0.0"}, {foo: "1.5.0"}), "utf8")
+      }
+
+      // A hung command is killed after 15 s and reports exit code null
+      await conflictedProject()
+      const quiet = await harness.run(["--quiet"], {}, harness.dir, 15_000)
+      assert.equal(quiet.code, 0, `--quiet hung or failed: ${quiet.stderr}`)
+      assert.equal(quiet.stdout, "")
+
+      await conflictedProject()
+      const json = await harness.run(["--json"], {}, harness.dir, 15_000)
+      assert.equal(json.code, 0, `--json hung or failed: ${json.stderr}`)
+      const messages = json.stdout
+        .split("\n")
+        .filter(line => line.trim() !== "")
+        .map(line => JSON.parse(line).message)
+      assert(messages.includes("Regenerated package-lock.json"), messages.join(" / "))
     })
   })
 

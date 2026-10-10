@@ -10,7 +10,7 @@ import {spawn} from "node:child_process"
 import {mkdtemp, readFile, writeFile, rm} from "fs/promises"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
-import {conflictedDocument} from "./cli-harness.js"
+import {conflictedDocument, runCliWithSlowReader} from "./cli-harness.js"
 
 const CLI_PATH = join(__dirname, "..", "cli.js")
 
@@ -164,6 +164,35 @@ describe("CLI end-to-end", () => {
       for (const line of lines) {
         assert.doesNotThrow(() => JSON.parse(line), `not valid JSON: ${line}`)
       }
+    })
+  })
+
+  test("--json output larger than a pipe buffer is printed in full", async () => {
+    await withTempDir(async dir => {
+      // The conflict list alone is over 400 KB, far more than a pipe holds (64 KB):
+      // with a slow reader the last lines are still queued when the command finishes
+      const names = Array.from({length: 3000}, (_, index) => `package-${index}`)
+      const dependencies = (major: number) => Object.fromEntries(names.map(name => [name, `^${major}.0.0`]))
+      await writeFile(
+        join(dir, "package.json"),
+        conflictedDocument({dependencies: dependencies(1)}, {dependencies: dependencies(2)}),
+        "utf8"
+      )
+
+      const result = await runCliWithSlowReader(
+        ["package.json", "--json", "--dry-run", "--no-regenerate-lock"],
+        dir,
+        1500
+      )
+      assert.equal(result.code, 0, result.stderr)
+
+      const records = result.stdout
+        .split("\n")
+        .filter(line => line.trim() !== "")
+        .map(line => JSON.parse(line))
+      const resolved = records.find(record => record.message === "Resolved conflicts")
+      assert.equal(resolved.data.conflicts.length, names.length)
+      assert.equal(records[records.length - 1].message, "Would write resolved file to package.json")
     })
   })
 
