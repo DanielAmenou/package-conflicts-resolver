@@ -95,6 +95,16 @@ describe("Package manager detection", () => {
     })
   })
 
+  test("a package.json without a usable packageManager field falls through to the lockfiles", async () => {
+    for (const manifest of ['{"name": "app"}', '{"packageManager": 1}', '{"packageManager": "deno@2.0.0"}']) {
+      await withTempDir(async dir => {
+        await writeFile(join(dir, "package.json"), manifest, "utf8")
+        await writeFile(join(dir, "yarn.lock"), "", "utf8")
+        assert.equal(await detectPackageManager(dir), "yarn", manifest)
+      })
+    }
+  })
+
   test("defaults to npm when nothing is found", async () => {
     await withTempDir(async dir => {
       assert.equal(await detectPackageManager(dir), "npm")

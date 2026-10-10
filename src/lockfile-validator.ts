@@ -16,7 +16,7 @@
  * Lockfile v1 files (npm 6) have no `packages` section and are not checked.
  */
 
-import * as semver from "semver"
+import {satisfies, valid, validRange} from "semver"
 import {LockfileIssue} from "./types.js"
 
 /** Fields of a lockfile entry that declare dependency edges npm will install */
@@ -72,7 +72,7 @@ function parseSpec(spec: string): {range: string; alias?: string} | null {
     text = "*"
   }
 
-  const range = semver.validRange(text, {includePrerelease: true})
+  const range = validRange(text, {includePrerelease: true})
   if (range === null) {
     return null
   }
@@ -152,7 +152,7 @@ function checkEdge(
   }
 
   const version = target.entry.version
-  if (typeof version !== "string" || semver.valid(version) === null) {
+  if (typeof version !== "string" || valid(version) === null) {
     return null // links without a version, bundled placeholders, ...: cannot judge
   }
 
@@ -168,7 +168,7 @@ function checkEdge(
     }
   }
 
-  if (!semver.satisfies(version, parsed.range, {includePrerelease: true})) {
+  if (!satisfies(version, parsed.range, {includePrerelease: true})) {
     return {
       from,
       name,

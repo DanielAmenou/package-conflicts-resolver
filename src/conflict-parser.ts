@@ -53,8 +53,7 @@ export class ConflictParser {
     }
 
     for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      if (line === undefined) continue
+      const line = lines[i] as string
       const marker = this.markerText(line)
 
       if (this.CONFLICT_START.test(marker)) {

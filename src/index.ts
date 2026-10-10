@@ -35,7 +35,7 @@ export type {NpmVersionLookupOptions, PackageVersionLookup, PackageVersions} fro
 export {formatConflictReport, reportFile} from "./conflict-report.js"
 export type {ConflictReport, ConflictReportFile, OtherConflict} from "./conflict-report.js"
 
-export * from "./types.js"
-
-// Re-export for convenience
+// Every type of types.ts, and its two runtime values by name: unlike `export *`,
+// this compiles to plain re-exports, without a CommonJS helper
+export type * from "./types.js"
 export {RESOLUTION_STRATEGIES, STABLE_PACKAGE_JSON_FIELDS} from "./types.js"

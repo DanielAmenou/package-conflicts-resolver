@@ -8,7 +8,8 @@ import {Command} from "commander"
 import {spawn} from "node:child_process"
 import {readFileSync} from "node:fs"
 import {basename, dirname, join, resolve} from "node:path"
-import {readFile, access} from "fs/promises"
+import {createInterface} from "node:readline"
+import {readFile, access, writeFile} from "fs/promises"
 import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
 import {Logger} from "./logger.js"
@@ -38,6 +39,9 @@ const GITATTRIBUTES_ENTRIES = [
   "package-lock.json merge=package-conflicts-resolver",
   "npm-shrinkwrap.json merge=package-conflicts-resolver",
 ]
+
+/** Exit code of `git config --unset` when the key is not set */
+const GIT_CONFIG_KEY_NOT_SET = 5
 
 /**
  * Read the tool version from its own package.json (single source of truth)
@@ -817,64 +821,55 @@ async function regenerateLockfiles(
 async function setupGitIntegration(global: boolean, skipGitattributes: boolean = false): Promise<void> {
   const scope = global ? "--global" : "--local"
 
-  try {
-    // Setup merge driver
-    const gitProcess = spawn("git", [
-      "config",
-      scope,
-      "merge.package-conflicts-resolver.driver",
-      "npx package-conflicts-resolver merge-driver %A %O %B",
-    ])
+  // Setup merge driver (a failure is reported by the setup command)
+  const gitProcess = spawn("git", [
+    "config",
+    scope,
+    "merge.package-conflicts-resolver.driver",
+    "npx package-conflicts-resolver merge-driver %A %O %B",
+  ])
 
-    await new Promise<void>((resolve, reject) => {
-      gitProcess.on("close", code => {
-        if (code === 0) {
-          resolve()
-        } else {
-          reject(new Error(`git config failed with exit code ${code}`))
-        }
-      })
-      gitProcess.on("error", reject)
-    })
-
-    // Set merge driver name for better git messages
-    const nameProcess = spawn("git", [
-      "config",
-      scope,
-      "merge.package-conflicts-resolver.name",
-      "Automatic package.json conflict resolver",
-    ])
-
-    await new Promise<void>((resolve, reject) => {
-      nameProcess.on("close", code => {
-        if (code === 0) {
-          resolve()
-        } else {
-          // Don't fail if name setting fails
-          resolve()
-        }
-      })
-      nameProcess.on("error", () => resolve())
-    })
-
-    console.log(`✅ Git merge driver configured ${global ? "globally" : "locally"}`)
-
-    if (!global && !skipGitattributes) {
-      // Try to setup .gitattributes automatically
-      await setupGitattributes()
-    } else if (global) {
-      console.log(`\n⚠️  Global setup complete, but you still need to add .gitattributes to each repository:`)
-      console.log(`\nAdd this to your .gitattributes file in each project:`)
-      for (const entry of GITATTRIBUTES_ENTRIES) {
-        console.log(`  ${entry}`)
+  await new Promise<void>((resolve, reject) => {
+    gitProcess.on("close", code => {
+      if (code === 0) {
+        resolve()
+      } else {
+        reject(new Error(`git config failed with exit code ${code}`))
       }
-      console.log(`\nOr run 'package-conflicts-resolver setup' (without --global) in each repository.`)
-    }
+    })
+    gitProcess.on("error", reject)
+  })
 
-    console.log(`\n✅ Setup complete! Run 'package-conflicts-resolver verify' to test the configuration.`)
-  } catch (error) {
-    throw new Error(`Failed to setup Git integration: ${error instanceof Error ? error.message : String(error)}`)
+  // Set merge driver name for better git messages
+  const nameProcess = spawn("git", [
+    "config",
+    scope,
+    "merge.package-conflicts-resolver.name",
+    "Automatic package.json conflict resolver",
+  ])
+
+  // The name only labels the driver in Git's messages: setup succeeds even if setting it fails
+  await new Promise<void>(resolve => {
+    const done = () => resolve()
+    nameProcess.on("close", done)
+    nameProcess.on("error", done)
+  })
+
+  console.log(`✅ Git merge driver configured ${global ? "globally" : "locally"}`)
+
+  if (!global && !skipGitattributes) {
+    // Try to setup .gitattributes automatically
+    await setupGitattributes()
+  } else if (global) {
+    console.log(`\n⚠️  Global setup complete, but you still need to add .gitattributes to each repository:`)
+    console.log(`\nAdd this to your .gitattributes file in each project:`)
+    for (const entry of GITATTRIBUTES_ENTRIES) {
+      console.log(`  ${entry}`)
+    }
+    console.log(`\nOr run 'package-conflicts-resolver setup' (without --global) in each repository.`)
   }
+
+  console.log(`\n✅ Setup complete! Run 'package-conflicts-resolver verify' to test the configuration.`)
 }
 
 /**
@@ -901,8 +896,6 @@ async function setupGitattributes(): Promise<void> {
     const missingLines = requiredLines.filter(requiredLine => !lines.some(line => line.trim() === requiredLine))
 
     if (missingLines.length > 0) {
-      const {writeFile} = await import("fs/promises")
-
       // Preserve original content and append missing lines
       let newContent = content
       if (newContent && !newContent.endsWith("\n")) {
@@ -1114,6 +1107,16 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
   }
 
   // Provide informative message about what will be removed
+  if (global && !hasGlobal) {
+    if (hasLocal) {
+      console.log("ℹ️  Only local configuration found. Run without --global to remove it.")
+      console.log("   Or run: package-conflicts-resolver uninstall")
+    } else {
+      console.log("ℹ️  No global Git merge driver configuration found to remove.")
+    }
+    return
+  }
+
   if (global && hasLocal) {
     console.log("⚠️  This will remove the global Git configuration.")
     console.log("   The local repository configuration will remain unchanged.")
@@ -1135,7 +1138,6 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
     console.log("\nProceed? (y/N)")
 
     // Simple confirmation - in a real implementation you might want to use a library like inquirer
-    const {createInterface} = await import("readline")
     const rl = createInterface({
       input: process.stdin,
       output: process.stdout,
@@ -1176,8 +1178,8 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
     const driverProcess = spawn("git", ["config", "--unset", scope, "merge.package-conflicts-resolver.driver"])
     await new Promise<void>((resolve, reject) => {
       driverProcess.on("close", code => {
-        if (code === 0 || code === 1) {
-          // 1 means the key didn't exist, which is fine
+        if (code === 0 || code === GIT_CONFIG_KEY_NOT_SET) {
+          // The key is gone either way
           console.log("✅ Removed merge driver configuration")
           resolve()
         } else {
@@ -1199,8 +1201,7 @@ async function uninstallGitIntegration(global: boolean, force: boolean): Promise
       nameProcess.on("close", code => {
         if (code === 0) {
           console.log("✅ Removed merge driver name")
-        } else if (code === 1) {
-          // Key didn't exist, which is fine
+        } else if (code === GIT_CONFIG_KEY_NOT_SET) {
           console.log("✅ Merge driver name was not set")
         }
         resolve()
@@ -1251,7 +1252,6 @@ async function cleanupGitattributes(): Promise<void> {
     })
 
     if (filteredLines.length !== lines.length) {
-      const {writeFile} = await import("fs/promises")
       await writeFile(gitattributesPath, filteredLines.join("\n"), "utf8")
 
       const removedCount = lines.length - filteredLines.length
@@ -1266,11 +1266,10 @@ async function cleanupGitattributes(): Promise<void> {
       console.log("✅ No package-conflicts-resolver entries found in .gitattributes")
     }
   } catch (error) {
-    if ((error as any).code === "ENOENT") {
-      console.log("✅ .gitattributes file does not exist (nothing to clean up)")
-    } else {
-      throw new Error(`Failed to clean .gitattributes: ${error instanceof Error ? error.message : String(error)}`)
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error // reported by the caller
     }
+    console.log("✅ .gitattributes file does not exist (nothing to clean up)")
   }
 }
 

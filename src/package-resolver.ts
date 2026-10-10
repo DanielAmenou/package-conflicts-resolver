@@ -2,6 +2,7 @@
  * Main package.json conflict resolver
  */
 
+import {writeFile} from "fs/promises"
 import {isDeepStrictEqual} from "node:util"
 import {ConflictParser} from "./conflict-parser.js"
 import {VersionResolver} from "./version-resolver.js"
@@ -708,13 +709,8 @@ export class PackageResolver {
       return undefined
     }
 
-    let data: any
-    try {
-      data = ConflictParser.parsePartialJson(side)
-    } catch {
-      return undefined
-    }
-
+    // parsePartialJson never throws
+    const data = ConflictParser.parsePartialJson(side)
     if (!this.isPlainObject(data)) {
       return undefined
     }
@@ -774,24 +770,17 @@ export class PackageResolver {
     let picked = 0
 
     // First add all our dependencies in their original order
-    for (const packageName of Object.keys(ourDeps)) {
-      const ourVersion = ourDeps[packageName]
-      if (ourVersion !== undefined) {
-        merged[packageName] = ourVersion
-      }
+    for (const [packageName, ourVersion] of Object.entries(ourDeps)) {
+      merged[packageName] = ourVersion
     }
 
     // Then add their dependencies that we don't have, maintaining their order
-    for (const packageName of Object.keys(theirDeps)) {
-      const theirVersion = theirDeps[packageName]
-      if (theirVersion === undefined) continue
-
+    for (const [packageName, theirVersion] of Object.entries(theirDeps)) {
       if (!(packageName in merged)) {
         merged[packageName] = theirVersion
       } else {
+        // Defined, since the package is in merged
         const ourVersion = merged[packageName]
-        // At this point we know theirVersion is defined (checked above)
-        // and ourVersion must be defined since it's in merged
         if (ourVersion !== theirVersion) {
           // Version conflict: a picked version wins, otherwise the strategy decides
           const spec = this.specAt(container, packageName, context)
@@ -1025,8 +1014,7 @@ export class PackageResolver {
     if (this.options.dryRun) {
       this.logger.info(`Would write resolved file to ${filePath}`)
     } else {
-      const fs = await import("fs/promises")
-      await fs.writeFile(filePath, content, "utf8")
+      await writeFile(filePath, content, "utf8")
       this.logger.success(`Wrote resolved file to ${filePath}`)
     }
   }
@@ -1151,15 +1139,7 @@ export class PackageResolver {
     theirValue: any[],
     context: MergeContext
   ): MergeOutcome {
-    if (Array.isArray(baseValue)) {
-      if (isDeepStrictEqual(ourValue, baseValue)) {
-        return {value: theirValue, conflicts: []}
-      }
-      if (isDeepStrictEqual(theirValue, baseValue)) {
-        return {value: ourValue, conflicts: []}
-      }
-    }
-
+    // Both sides changed the array: mergeValue already kept the changed side of a one-sided change
     if (ourValue.every(this.isPrimitiveValue) && theirValue.every(this.isPrimitiveValue)) {
       const mergedArray = [...ourValue]
       for (const item of theirValue) {

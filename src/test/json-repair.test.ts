@@ -272,3 +272,63 @@ describe("parseJsonLenient property tests", () => {
     }
   })
 })
+
+/**
+ * Engines word JSON syntax errors differently: V8 reports "Expected ',' or '}'
+ * after property value in JSON at position 9", older engines "Unexpected
+ * string in JSON at position 9". These tests replay V8's errors in other
+ * wordings, to check that the repair relies only on what every wording says.
+ */
+describe("parseJsonLenient with other engines' error messages", () => {
+  const parse = JSON.parse
+
+  /** Run `fn` while every error JSON.parse throws carries a rewritten message */
+  function withMessages(rewrite: (message: string) => string, fn: () => void): void {
+    JSON.parse = ((text: string, reviver?: (this: any, key: string, value: any) => any) => {
+      try {
+        return parse(text, reviver)
+      } catch (error) {
+        throw new SyntaxError(rewrite((error as Error).message))
+      }
+    }) as typeof JSON.parse
+    try {
+      fn()
+    } finally {
+      JSON.parse = parse
+    }
+  }
+
+  test("repairs a missing comma reported as an unexpected string", () => {
+    const olderWording = (message: string) =>
+      message.replace(
+        /^Expected ',' or '[}\]]' after \w+ \w+ in JSON at (position \d+).*$/s,
+        "Unexpected string in JSON at $1"
+      )
+
+    withMessages(olderWording, () => {
+      assert.deepEqual(parseJsonLenient('{"a": "x"\n"b": "y"}'), {a: "x", b: "y"})
+    })
+  })
+
+  test("gives up when the error does not say where it happened", () => {
+    withMessages(
+      message => message.replace(/ in JSON at position \d+.*$/s, ""),
+      () => {
+        assert.throws(
+          () => parseJsonLenient('{"a": 1\n"b": 2}'),
+          /^SyntaxError: Expected ',' or '}' after property value$/
+        )
+      }
+    )
+  })
+
+  test("only inserts a comma right after a value, whatever position is reported", () => {
+    // Position 5 sits right after the colon: no value ends there
+    withMessages(
+      message => message.replace(/position \d+.*$/s, "position 5"),
+      () => {
+        assert.throws(() => parseJsonLenient('{"a": "x" "b": "y"}'), SyntaxError)
+      }
+    )
+  })
+})

@@ -421,3 +421,118 @@ describe("Fallback resolution keeps multi-property conflicts intact", () => {
     })
   })
 })
+
+describe("Fallback resolution of less common conflict shapes", () => {
+  test("the winning side takes the losing side's trailing comma when entries follow", async () => {
+    const content = [
+      "{",
+      '  "lockfileVersion": 3,',
+      '  "packages": {',
+      "<<<<<<< HEAD",
+      '    "node_modules/lodash": { // pinned',
+      '      "version": "4.17.20",',
+      '      "integrity": "sha512-ours"',
+      "    },",
+      "=======",
+      '    "node_modules/lodash": {',
+      '      "version": "4.17.21",',
+      '      "integrity": "sha512-theirs"',
+      "    }",
+      ">>>>>>> feature",
+      '    "node_modules/react": {',
+      '      "version": "18.2.0"',
+      "    }",
+      "  }",
+      "}",
+    ].join("\n")
+
+    const result = await makeResolver().resolveConflicts(content)
+    assert.equal(result.resolved, true, result.errors.join(", "))
+    assert.deepEqual(result.packageJson?.packages, {
+      "node_modules/lodash": {version: "4.17.21", integrity: "sha512-theirs"},
+      "node_modules/react": {version: "18.2.0"},
+    })
+    // The comma travels with the winning block instead of being left to the lenient parse
+    const lodash = result.conflicts.find(conflict => conflict.field === "node_modules/lodash")
+    assert.match(lodash?.resolvedValue ?? "", /"sha512-theirs"\n\s*\},$/)
+  })
+
+  test("a value laid out over several lines is kept whole from one side", async () => {
+    const content = [
+      "{",
+      '  "version": "1.0.0",',
+      '  "files":',
+      "<<<<<<< HEAD",
+      "  [",
+      '    "dist"',
+      "  ]",
+      "=======",
+      "  [",
+      '    "lib" // old layout',
+      "  ]",
+      ">>>>>>> feature",
+      "}",
+    ].join("\n")
+
+    const result = await makeResolver().resolveConflicts(content)
+    assert.equal(result.resolved, true, result.errors.join(", "))
+    assert.deepEqual(result.packageJson, {version: "1.0.0", files: ["dist"]})
+  })
+
+  test("a dependency field declared inside the conflict merges the entries of both sides", async () => {
+    const content = [
+      "{",
+      '  "name": "app",',
+      "<<<<<<< HEAD",
+      '  "dependencies": {',
+      '    "lodash": "^4.17.21"',
+      "  }",
+      "=======",
+      '  "dependencies": {',
+      '    "lodash": "^4.17.20", // older',
+      '    "react": "^18.0.0"',
+      "  }",
+      ">>>>>>> feature",
+      "}",
+    ].join("\n")
+
+    const result = await makeResolver().resolveConflicts(content)
+    assert.equal(result.resolved, true, result.errors.join(", "))
+    assert.deepEqual(result.packageJson, {name: "app", dependencies: {lodash: "^4.17.21", react: "^18.0.0"}})
+  })
+
+  test("a single-value conflict keeps our side when it wins", async () => {
+    const content = [
+      "{",
+      '  "name": "app",',
+      "<<<<<<< HEAD",
+      '  "version": "2.0.0", // major',
+      "=======",
+      '  "version": "1.2.0",',
+      ">>>>>>> feature",
+      '  "private": true',
+      "}",
+    ].join("\n")
+
+    const result = await makeResolver().resolveConflicts(content)
+    assert.equal(result.resolved, true, result.errors.join(", "))
+    assert.deepEqual(result.packageJson, {name: "app", version: "2.0.0", private: true})
+  })
+
+  test("an unquoted value is written back as a JSON string", async () => {
+    const content = [
+      "{",
+      '  "name": "app",',
+      "<<<<<<< HEAD",
+      '  "version": 1.1.0',
+      "=======",
+      '  "version": 1.2.0',
+      ">>>>>>> feature",
+      "}",
+    ].join("\n")
+
+    const result = await makeResolver().resolveConflicts(content)
+    assert.equal(result.resolved, true, result.errors.join(", "))
+    assert.deepEqual(result.packageJson, {name: "app", version: "1.2.0"})
+  })
+})

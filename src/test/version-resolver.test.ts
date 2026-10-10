@@ -166,6 +166,13 @@ describe("VersionResolver", () => {
       assert(result.reason.includes("not comparable"))
     })
 
+    test("an unsatisfiable range is compared by the version it names", () => {
+      // A valid range that no version satisfies has no minimum to compare by
+      const result = VersionResolver.resolveVersion(">2.0.0 <1.0.0", "^1.5.0", "highest")
+      assert.equal(result.resolved, ">2.0.0 <1.0.0")
+      assert.match(result.reason, /is higher than 1\.5\.0/)
+    })
+
     test("prerelease-only comparison keeps semver ordering", () => {
       assert.equal(VersionResolver.resolveVersion("2.0.0-rc.2", "2.0.0-rc.1", "highest").resolved, "2.0.0-rc.2")
     })
@@ -193,6 +200,12 @@ describe("VersionResolver", () => {
       assert.equal(VersionResolver.resolveNonVersion(2, 3, "highest").resolved, 3)
       assert.equal(VersionResolver.resolveNonVersion(2, 3, "lowest").resolved, 2)
       assert.equal(VersionResolver.resolveNonVersion(3, 2, "highest").resolved, 3)
+    })
+
+    test("identical strings resolve to themselves under highest and lowest", () => {
+      for (const strategy of ["highest", "lowest"] as const) {
+        assert.equal(VersionResolver.resolveNonVersion("same", "same", strategy).resolved, "same", strategy)
+      }
     })
 
     test("theirs strategy returns their value", () => {
@@ -278,6 +291,19 @@ describe("tie-breaks between ranges with the same minimum", () => {
     assert.equal(VersionResolver.resolveVersion("^1.2.3", "~1.2.3", "lowest").resolved, "~1.2.3")
     assert.equal(VersionResolver.resolveVersion("~1.2.3", "^1.2.3", "lowest").resolved, "~1.2.3")
     assert.equal(VersionResolver.resolveVersion("^1.2.3", ">=1.2.3", "lowest").resolved, "^1.2.3")
+  })
+
+  test("lowest ranks a <= range above a bare < range with the same minimum", () => {
+    // Both ranges start at 0.0.0
+    assert.equal(VersionResolver.resolveVersion("<=2.0.0", "<3.0.0", "lowest").resolved, "<=2.0.0")
+    assert.equal(VersionResolver.resolveVersion("<3.0.0", "<=2.0.0", "lowest").resolved, "<=2.0.0")
+  })
+
+  test("lowest keeps ours between two equivalent ranges written differently", () => {
+    // Both mean >=1.2.0 <1.3.0-0
+    const result = VersionResolver.resolveVersion("1.2.x", "1.2", "lowest")
+    assert.equal(result.resolved, "1.2.x")
+    assert.match(result.reason, /equal restrictiveness/)
   })
 
   test("lowest keeps ours when restrictiveness is equal", () => {

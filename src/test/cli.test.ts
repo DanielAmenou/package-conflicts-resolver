@@ -10,6 +10,7 @@ import {spawn} from "node:child_process"
 import {mkdtemp, readFile, writeFile, rm} from "fs/promises"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
+import {conflictedDocument} from "./cli-harness.js"
 
 const CLI_PATH = join(__dirname, "..", "cli.js")
 
@@ -101,6 +102,33 @@ describe("CLI end-to-end", () => {
       const result = await runCli(["package.json", "--no-regenerate-lock"], dir)
       assert.equal(result.code, 0)
       assert(result.stdout.includes("No Git conflict markers"))
+    })
+  })
+
+  test("--json reports a file without conflicts as one JSON record", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), '{\n  "name": "clean"\n}\n', "utf8")
+
+      const result = await runCli(["package.json", "--json", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+
+      const lines = result.stdout.split("\n").filter(line => line.trim() !== "")
+      assert.equal(lines.length, 1, result.stdout)
+      const record = JSON.parse(lines[0] as string)
+      assert.equal(record.level, "info")
+      assert.equal(record.message, "No Git conflict markers found in package.json")
+      assert.deepEqual(record.data, {conflicts: 0})
+    })
+  })
+
+  test("--quiet prints nothing when there is nothing to resolve", async () => {
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package.json"), '{\n  "name": "clean"\n}\n', "utf8")
+
+      const result = await runCli(["package.json", "--quiet", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stdout, "")
+      assert.equal(result.stderr, "")
     })
   })
 
@@ -239,6 +267,20 @@ describe("CLI companion lockfile resolution", () => {
 
       const lock = JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8"))
       assert.equal(lock.version, "1.2.0")
+    })
+  })
+
+  test("a package-lock.json that is not an npm lockfile is merged without a consistency check", async () => {
+    await withTempDir(async dir => {
+      const pkg = {name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}
+      await writeFile(join(dir, "package.json"), JSON.stringify(pkg, null, 2) + "\n", "utf8")
+      // No lockfileVersion: a plain JSON document, with no dependency graph to check
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED, "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stderr, "")
+      assert.equal(JSON.parse(await readFile(join(dir, "package-lock.json"), "utf8")).version, "1.2.0")
     })
   })
 })
@@ -397,6 +439,12 @@ const lockWith = (rootDeps: Record<string, string>, packages: Record<string, any
     packages: {"": {name: "app", version: "1.0.0", dependencies: rootDeps}, ...packages},
   })
 
+/** Lock entries for bar and foo, both at `version` */
+const twoLocked = (version: string) => ({
+  "node_modules/bar": lockEntry("bar", version),
+  "node_modules/foo": lockEntry("foo", version),
+})
+
 describe("CLI merge-driver lockfile consistency", () => {
   // Ours kept the range and moved the lock to 1.5.0; theirs pinned 1.2.0. The
   // range comparison picks the pin, the exact comparison picks 1.5.0: the
@@ -422,6 +470,21 @@ describe("CLI merge-driver lockfile consistency", () => {
       const written = JSON.parse(await readFile(currentPath, "utf8"))
       assert.equal(written.packages[""].dependencies.foo, "1.2.0")
       assert.equal(written.packages["node_modules/foo"].version, "1.5.0")
+    })
+  })
+
+  test("counts several unsatisfied dependencies in the plural", async () => {
+    await withTempDir(async dir => {
+      const currentPath = join(dir, "current.json")
+      await writeFile(currentPath, lockWith({bar: "^1.0.0", foo: "^1.0.0"}, twoLocked("1.5.0")), "utf8")
+      await writeFile(join(dir, "base.json"), "", "utf8")
+      await writeFile(join(dir, "other.json"), lockWith({bar: "1.2.0", foo: "1.2.0"}, twoLocked("1.2.0")), "utf8")
+
+      const result = await runCli(["merge-driver", currentPath, join(dir, "base.json"), join(dir, "other.json")], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /merged lockfile is not consistent \(2 unsatisfied dependencies\)/)
+      assert.match(result.stderr, /requires bar@1\.2\.0 but node_modules\/bar is 1\.5\.0/)
+      assert.match(result.stderr, /requires foo@1\.2\.0 but node_modules\/foo is 1\.5\.0/)
     })
   })
 
@@ -679,6 +742,58 @@ describe("CLI lockfile consistency without regeneration", () => {
       const result = await runCli(["package-lock.json", "--no-regenerate-lock"], dir)
       assert.equal(result.code, 1)
       assert.match(result.stderr, /package-lock\.json was merged but its dependency graph is not consistent/)
+    })
+  })
+
+  test("counts several unsatisfied dependencies in the plural", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {bar: "1.2.0", foo: "1.2.0"}}),
+        "utf8"
+      )
+      const ours = JSON.parse(lockWith({bar: "^1.0.0", foo: "^1.0.0"}, twoLocked("1.5.0")))
+      const theirs = JSON.parse(lockWith({bar: "1.2.0", foo: "1.2.0"}, twoLocked("1.2.0")))
+      await writeFile(join(dir, "package-lock.json"), conflictedDocument(ours, theirs), "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /not consistent \(2 unsatisfied dependencies\)/)
+    })
+  })
+
+  test("--dry-run --quiet says nothing about an inconsistent lockfile", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      await writeFile(join(dir, "package-lock.json"), CONFLICTED_INCONSISTENT_LOCK, "utf8")
+
+      const result = await runCli(["--dry-run", "--quiet", "--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.equal(result.stdout, "")
+      assert.equal(result.stderr, "")
+      assert.equal(await readFile(join(dir, "package-lock.json"), "utf8"), CONFLICTED_INCONSISTENT_LOCK)
+    })
+  })
+
+  test("checks against a package.json saved with a byte order mark", async () => {
+    await withTempDir(async dir => {
+      await writeFile(
+        join(dir, "package.json"),
+        "\ufeff" + j({name: "app", version: "1.0.0", dependencies: {foo: "1.2.0"}}),
+        "utf8"
+      )
+      // The merged lockfile is consistent on its own: only package.json's pin reveals the problem
+      const ours = JSON.parse(lockWith({foo: "^1.0.0"}, {"node_modules/foo": lockEntry("foo", "1.5.0")}))
+      const theirs = JSON.parse(lockWith({foo: "^1.0.0"}, {"node_modules/foo": lockEntry("foo", "1.4.0")}))
+      await writeFile(join(dir, "package-lock.json"), conflictedDocument(ours, theirs), "utf8")
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 1)
+      assert.match(result.stderr, /the root project requires foo@1\.2\.0 but node_modules\/foo is 1\.5\.0/)
     })
   })
 })

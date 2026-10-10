@@ -126,4 +126,49 @@ describe("ConflictParser", () => {
     assert.equal(ConflictParser.isValidJson("{invalid json}"), false)
     assert.equal(ConflictParser.isValidJson(""), false)
   })
+
+  test("extractFieldName looks past blank lines for the field enclosing a conflict", () => {
+    const content = [
+      "{",
+      '  "devDependencies": {',
+      "",
+      "<<<<<<< HEAD",
+      '    "^1.0.0"',
+      "=======",
+      '    "^2.0.0"',
+      ">>>>>>> feature",
+      "  }",
+      "}",
+    ].join("\n")
+
+    assert.equal(ConflictParser.extractFieldName('    "^1.0.0"', content, 3), "devDependencies")
+  })
+
+  test("extractFieldName stops climbing once it has left more than two levels of objects", () => {
+    const content = [
+      "{",
+      '  "config": {',
+      '    "a": {',
+      '      "b": {',
+      '        "c": 1',
+      "      }}},",
+      '  "files": [',
+      "<<<<<<< HEAD",
+      '    "dist"',
+      "=======",
+      '    "lib"',
+      ">>>>>>> feature",
+      "  ]",
+      "}",
+    ].join("\n")
+
+    // Climbing on would wrongly report "config", whose object closed above the conflict
+    assert.equal(ConflictParser.extractFieldName('    "dist"', content, 7), undefined)
+  })
+
+  test("parsePartialJson returns a complete JSON value as it is", () => {
+    assert.deepEqual(ConflictParser.parsePartialJson('  {"lodash": "^4.17.21"}  '), {lodash: "^4.17.21"})
+    assert.deepEqual(ConflictParser.parsePartialJson('[\n  "dist"\n]'), ["dist"])
+    assert.equal(ConflictParser.parsePartialJson('"^1.0.0"'), "^1.0.0")
+  })
 })

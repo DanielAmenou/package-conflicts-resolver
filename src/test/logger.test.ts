@@ -199,6 +199,11 @@ describe("Logger attached data", () => {
     assert(captured.errors.some(line => line.includes('"detail": "why"')))
   })
 
+  test("debug prints its data below the message when verbose", () => {
+    const captured = capture(() => new Logger(VERBOSE).debug("details", {x: 1}))
+    assert.deepEqual(captured.logs, ["🔍 details", JSON.stringify({x: 1}, null, 2)])
+  })
+
   test("data survives the round trip in json mode", () => {
     const captured = capture(() => new Logger(JSON_MODE).info("with data", {nested: {list: [1, 2]}}))
 
