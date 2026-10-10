@@ -5,7 +5,7 @@
 import {strict as assert} from "assert"
 import {test, describe} from "node:test"
 import {formatConflictReport, reportFile, unanalyzedFile, ConflictReport} from "../conflict-report.js"
-import {PackageConflict, ResolutionResult, ResolvedConflict} from "../types.js"
+import {PackageConflict, ResolutionResult, ResolvedConflict, UnresolvedConflict} from "../types.js"
 
 const pkg = (overrides: Partial<PackageConflict>): PackageConflict => ({
   name: "lodash",
@@ -85,6 +85,25 @@ describe("reportFile", () => {
     ])
   })
 
+  test("values left for the user are listed with both sides, as text", () => {
+    const unresolved: UnresolvedConflict[] = [
+      {field: "scripts.build", path: ["scripts", "build"], ours: "tsc -b", theirs: "tsc && vite build", base: "tsc"},
+      {field: "private", path: ["private"], ours: true, theirs: false},
+      {field: "exports", path: ["exports"], ours: "./index.js", theirs: {".": "./dist/index.js"}},
+    ]
+    const report = reportFile("package.json", {...resolvedResult([field({})]), unresolved})
+    assert.deepEqual(report.unresolved, [
+      {field: "scripts.build", ours: "tsc -b", theirs: "tsc && vite build", base: "tsc"},
+      {field: "private", ours: "true", theirs: "false"},
+      {field: "exports", ours: "./index.js", theirs: '{".":"./dist/index.js"}'},
+    ])
+    assert.deepEqual(report.otherConflicts, [{field: "version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"}])
+  })
+
+  test("a result without unresolved values reports none", () => {
+    assert.deepEqual(reportFile("package.json", resolvedResult([])).unresolved, [])
+  })
+
   test("a file that could not be resolved is reported as not analyzed, with the reason", () => {
     const report = reportFile("package.json", {resolved: false, conflicts: [], errors: ["Unexpected token", "oops"]})
     assert.deepEqual(report, {
@@ -92,6 +111,7 @@ describe("reportFile", () => {
       analyzed: false,
       packages: [],
       otherConflicts: [],
+      unresolved: [],
       reason: "Unexpected token, oops",
     })
   })
@@ -102,6 +122,7 @@ describe("reportFile", () => {
       analyzed: false,
       packages: [],
       otherConflicts: [],
+      unresolved: [],
       reason: "yarn resolves it",
     })
   })
@@ -126,6 +147,7 @@ describe("formatConflictReport", () => {
             }),
           ],
           otherConflicts: [{field: "version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"}],
+          unresolved: [],
         },
       ],
     }
@@ -151,6 +173,7 @@ describe("formatConflictReport", () => {
           analyzed: true,
           packages: [pkg({name: "a", base: "^4.17.15"}), pkg({name: "b"})],
           otherConflicts: [],
+          unresolved: [],
         },
       ],
     }
@@ -188,6 +211,7 @@ describe("formatConflictReport", () => {
             }),
           ],
           otherConflicts: [],
+          unresolved: [],
         },
       ],
     }
@@ -205,7 +229,7 @@ describe("formatConflictReport", () => {
     const report: ConflictReport = {
       strategy: "theirs",
       files: [
-        {file: "package.json", analyzed: true, packages: [pkg({kind: "lock"})], otherConflicts: []},
+        {file: "package.json", analyzed: true, packages: [pkg({kind: "lock"})], otherConflicts: [], unresolved: []},
         {
           file: "npm-shrinkwrap.json",
           analyzed: true,
@@ -214,8 +238,16 @@ describe("formatConflictReport", () => {
             {field: "scripts.build", ours: longScript, theirs: "tsc", resolved: "tsc"},
             {field: "packages..version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"},
           ],
+          unresolved: [],
         },
-        {file: "pnpm-lock.yaml", analyzed: false, packages: [], otherConflicts: [], reason: "pnpm resolves it"},
+        {
+          file: "pnpm-lock.yaml",
+          analyzed: false,
+          packages: [],
+          otherConflicts: [],
+          unresolved: [],
+          reason: "pnpm resolves it",
+        },
       ],
     }
     const lines = formatConflictReport(report)
@@ -235,10 +267,37 @@ describe("formatConflictReport", () => {
     )
   })
 
+  test("values left for the user get their own line, and a hint on how to finish", () => {
+    const lines = formatConflictReport({
+      strategy: "highest",
+      files: [
+        {
+          file: "package.json",
+          analyzed: true,
+          packages: [],
+          otherConflicts: [{field: "version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"}],
+          unresolved: [
+            {field: "scripts.build", ours: "tsc -b", theirs: `vite build ${"x".repeat(40)}`},
+            {field: "private", ours: "true", theirs: "false"},
+          ],
+        },
+      ],
+    })
+    assert.deepEqual(lines, [
+      "📋 package.json: no conflicted packages",
+      "",
+      "   Also conflicted: version (ours 1.1.0, theirs 1.2.0 → 1.2.0)",
+      "",
+      `   Left for you to decide: scripts.build (ours tsc -b, theirs vite build ${"x".repeat(28)}…), private (ours true, theirs false)`,
+      "",
+      "Values left for you to decide are not versions: resolving keeps them between conflict markers, unless you use --strategy ours or --strategy theirs",
+    ])
+  })
+
   test("no hint without packages, and a message when nothing is conflicted", () => {
     const onlyFields = formatConflictReport({
       strategy: "highest",
-      files: [{file: "package.json", analyzed: true, packages: [], otherConflicts: []}],
+      files: [{file: "package.json", analyzed: true, packages: [], otherConflicts: [], unresolved: []}],
     })
     assert.deepEqual(onlyFields, ["📋 package.json: no conflicted packages", ""])
 

@@ -4,7 +4,7 @@
  * resolution keeps — chosen by the strategy, or picked with `--pick`.
  */
 
-import {PackageConflict, ResolutionResult, ResolvedConflict} from "./types.js"
+import {PackageConflict, ResolutionResult, ResolvedConflict, UnresolvedConflict} from "./types.js"
 
 /** A conflict on something other than a package version ("version", "scripts.test", ...) */
 export interface OtherConflict {
@@ -12,6 +12,15 @@ export interface OtherConflict {
   ours: string
   theirs: string
   resolved: string
+}
+
+/** A value both branches changed that is not a version: resolving leaves it for the user to decide */
+export interface UnresolvedField {
+  field: string
+  ours: string
+  theirs: string
+  /** The common ancestor's value, when it is known */
+  base?: string
 }
 
 export interface ConflictReportFile {
@@ -23,6 +32,8 @@ export interface ConflictReportFile {
   packages: PackageConflict[]
   /** Every other conflict, resolved by the strategy */
   otherConflicts: OtherConflict[]
+  /** Values that are not versions: resolving leaves them between conflict markers for the user */
+  unresolved: UnresolvedField[]
   /** Why the file could not be analyzed */
   reason?: string
 }
@@ -43,7 +54,7 @@ const MAX_SUMMARY_VALUE = 40
  */
 export function reportFile(file: string, result: ResolutionResult): ConflictReportFile {
   if (!result.resolved) {
-    return {file, analyzed: false, packages: [], otherConflicts: [], reason: result.errors.join(", ")}
+    return {file, analyzed: false, packages: [], otherConflicts: [], unresolved: [], reason: result.errors.join(", ")}
   }
 
   return {
@@ -56,7 +67,22 @@ export function reportFile(file: string, result: ResolutionResult): ConflictRepo
       theirs: conflict.theirValue,
       resolved: conflict.resolvedValue,
     })),
+    unresolved: (result.unresolved ?? []).map(unresolvedField),
   }
+}
+
+function unresolvedField(conflict: UnresolvedConflict): UnresolvedField {
+  return {
+    field: conflict.field,
+    ours: describeValue(conflict.ours),
+    theirs: describeValue(conflict.theirs),
+    ...(conflict.base !== undefined ? {base: describeValue(conflict.base)} : {}),
+  }
+}
+
+/** A value as the report shows it: a string as it is, anything else as JSON */
+function describeValue(value: unknown): string {
+  return typeof value === "string" ? value : JSON.stringify(value)
 }
 
 /**
@@ -64,7 +90,7 @@ export function reportFile(file: string, result: ResolutionResult): ConflictRepo
  * pnpm and bun lockfiles, which their package manager resolves).
  */
 export function unanalyzedFile(file: string, reason: string): ConflictReportFile {
-  return {file, analyzed: false, packages: [], otherConflicts: [], reason}
+  return {file, analyzed: false, packages: [], otherConflicts: [], unresolved: [], reason}
 }
 
 /**
@@ -127,6 +153,12 @@ export function formatConflictReport(report: ConflictReport): string[] {
       )
       lines.push("", `   Also conflicted: ${others.join(", ")}`)
     }
+    if (file.unresolved.length > 0) {
+      const fields = file.unresolved.map(
+        conflict => `${conflict.field} (ours ${shorten(conflict.ours)}, theirs ${shorten(conflict.theirs)})`
+      )
+      lines.push("", `   Left for you to decide: ${fields.join(", ")}`)
+    }
     lines.push("")
   }
 
@@ -135,6 +167,11 @@ export function formatConflictReport(report: ConflictReport): string[] {
   if (example !== undefined && !packages.some(conflict => conflict.pick !== undefined)) {
     lines.push(
       `Choose the version of a package with --pick <name>@<version>, for example --pick ${example.name}@${example.theirs}`
+    )
+  }
+  if (report.files.some(file => file.unresolved.length > 0)) {
+    lines.push(
+      "Values left for you to decide are not versions: resolving keeps them between conflict markers, unless you use --strategy ours or --strategy theirs"
     )
   }
 

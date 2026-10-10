@@ -51,6 +51,28 @@ export interface ResolvedConflict {
 }
 
 /**
+ * A value of a package.json that both branches changed, to different values,
+ * and that is not a version: a script, the description, a boolean, an
+ * object... The highest and lowest strategies only order versions, so they
+ * leave such a value for the user to decide: the merged document holds our
+ * value in its place, and writeResolvedPackage() writes Git conflict markers
+ * around the property, with both values. The ours and theirs strategies decide
+ * it like any other conflict.
+ */
+export interface UnresolvedConflict {
+  /** The value's path joined with dots, like ResolvedConflict.field ("scripts.build") */
+  field: string
+  /** JSON path of the value */
+  path: string[]
+  /** Our value */
+  ours: unknown
+  /** Their value */
+  theirs: unknown
+  /** The common ancestor's value, when it is known and had one */
+  base?: unknown
+}
+
+/**
  * A package whose version both branches changed, to different values.
  */
 export interface PackageConflict {
@@ -123,6 +145,13 @@ export interface ResolutionResult {
    * resolved; also lists the values `picks` decided.
    */
   packageConflicts?: PackageConflict[]
+  /**
+   * Values left for the user to decide (see UnresolvedConflict). Set whenever
+   * conflicts were resolved. The document still counts as `resolved`, with
+   * our value in place of each of these: pass them to writeResolvedPackage()
+   * so that the file gets conflict markers instead.
+   */
+  unresolved?: UnresolvedConflict[]
 }
 
 export interface LoggerOptions {

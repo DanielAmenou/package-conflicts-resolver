@@ -44,12 +44,14 @@ describe("overrides and resolutions", () => {
   })
 
   test("a field that merely shares the name is not treated as a spec", async () => {
-    // A script called "overrides" is free-form text, compared as a string
+    // A script called "overrides" is free-form text: no version, so it is left for the user
     const ours = j({scripts: {overrides: "node apply-a.js"}})
     const theirs = j({scripts: {overrides: "node apply-b.js"}})
 
     const result = await makeResolver("highest").mergeJsonContents("", ours, theirs)
-    assert.equal(result.packageJson!.scripts!.overrides, "node apply-b.js")
+    assert.deepEqual(result.unresolved, [
+      {field: "scripts.overrides", path: ["scripts", "overrides"], ours: "node apply-a.js", theirs: "node apply-b.js"},
+    ])
   })
 
   test("yarn resolutions with path-style keys compare as versions", async () => {
@@ -120,14 +122,18 @@ describe("other manifest fields", () => {
     assert.deepEqual(result.packageJson!.workspaces, ["packages/*", "apps/*"])
   })
 
-  test("engines ranges use semver while unrelated strings do not", async () => {
+  test("engines ranges use semver while unrelated strings are left for the user", async () => {
     const ours = j({engines: {node: ">=9", npm: ">=9"}, license: "Apache-2.0"})
     const theirs = j({engines: {node: ">=10", npm: ">=10"}, license: "MIT"})
 
     const result = await makeResolver("highest").mergeJsonContents("", ours, theirs)
     assert.equal(result.packageJson!.engines!.node, ">=10", "semver: 10 > 9")
     assert.equal(result.packageJson!.engines!.npm, ">=10")
-    assert.equal(result.packageJson!.license, "MIT", "a license is compared as a plain string")
+    assert.deepEqual(
+      result.unresolved?.map(conflict => conflict.field),
+      ["license"],
+      "a license is no version: neither side is higher"
+    )
   })
 })
 

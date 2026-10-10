@@ -124,7 +124,7 @@ describe("PackageResolver", () => {
     assert.equal(result.conflicts[0]!.resolvedValue, "1.5.0") // ours strategy
   })
 
-  test("should resolve script conflicts", async () => {
+  test("should merge scripts and leave a script both sides changed for the user", async () => {
     const content = `{
   "name": "test-package",
   "version": "1.0.0",
@@ -145,11 +145,15 @@ describe("PackageResolver", () => {
     const result = await resolver.resolveConflicts(content)
 
     assert.equal(result.resolved, true)
-    assert.equal(result.conflicts.length, 1)
+    assert.equal(result.conflicts.length, 0)
+    // A script is no version: "highest" cannot choose between jest and mocha
+    assert.deepEqual(result.unresolved, [
+      {field: "scripts.test", path: ["scripts", "test"], ours: "jest", theirs: "mocha"},
+    ])
 
     const scripts = result.packageJson?.scripts
     assert(scripts)
-    assert(scripts.test) // Should be resolved based on strategy
+    assert.equal(scripts.test, "jest") // ours holds the place until the user decides
     assert.equal(scripts.build, "webpack") // from ours
     assert.equal(scripts.start, "node server.js") // from theirs
   })
@@ -298,9 +302,11 @@ describe("PackageResolver", () => {
     const result = await resolver.resolveConflicts(content)
 
     assert.equal(result.resolved, true)
-    assert.equal(result.conflicts.length, 2)
-    assert(result.conflicts.some(conflict => conflict.field === "scripts.test"))
-    assert(result.conflicts.some(conflict => conflict.field === "scripts.lint"))
+    assert.equal(result.conflicts.length, 0)
+    assert.deepEqual(
+      result.unresolved?.map(conflict => conflict.field),
+      ["scripts.test", "scripts.lint"]
+    )
 
     // Get the scripts in order
     const scripts = result.packageJson?.scripts
@@ -316,16 +322,8 @@ describe("PackageResolver", () => {
 
     // Verify the values are correct too
     assert.equal(scripts.build, "tsc", "build should be from ours")
-    assert.equal(
-      scripts.test,
-      "mocha",
-      "test should be from theirs (using highest strategy - mocha > jest lexicographically)"
-    )
-    assert.equal(
-      scripts.lint,
-      "prettier",
-      "lint should be from theirs (using highest strategy - prettier > eslint lexicographically)"
-    )
+    assert.equal(scripts.test, "jest", "test is left for the user, with ours in its place")
+    assert.equal(scripts.lint, "eslint", "lint is left for the user, with ours in its place")
     assert.equal(scripts.start, "node server.js", "start should be from theirs")
   })
 

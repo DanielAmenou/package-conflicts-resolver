@@ -104,7 +104,12 @@ describe("package conflicts in package.json", () => {
     assert.equal(byField["dependencies.lodash"], "lodash")
     assert.equal(byField["peerDependencies.react"], "react")
     assert.equal(byField["version"], undefined)
-    assert.equal(byField["scripts.build"], undefined)
+    // The script is no version: it is left for the user, and is no package conflict either
+    assert.deepEqual(
+      result.unresolved?.map(conflict => conflict.field),
+      ["scripts.build"]
+    )
+    assert(!result.packageConflicts?.some(conflict => conflict.name === "build"))
   })
 
   test("arrays of objects are resolved by the strategy and are no package conflicts", async () => {
@@ -548,9 +553,9 @@ describe("package conflicts in the block-based fallback (a side that is not vali
       "  }",
       "}",
     ].join("\n")
-    const result = await resolver({picks: {lint: "1.0.0"}}).resolveConflicts(content)
+    const result = await resolver({strategy: "ours", picks: {lint: "1.0.0"}}).resolveConflicts(content)
     assert.notEqual(result.conflicts[0]?.field, "scripts.lint", "resolved block by block")
-    // Commands do not compare as versions: the strategy keeps ours, the pick is not applied
+    // Commands are no versions: the strategy keeps ours, and the pick is not applied
     assert.equal(result.packageJson?.scripts?.lint, "eslint .")
     assert.deepEqual(result.packageConflicts, [])
     assert.equal(result.conflicts[0]?.package, undefined)

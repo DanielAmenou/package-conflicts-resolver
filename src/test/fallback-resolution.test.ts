@@ -391,7 +391,8 @@ describe("Fallback resolution keeps multi-property conflicts intact", () => {
       "}",
     ].join("\n")
 
-    const result = await makeResolver().resolveConflicts(content)
+    // A script is no version: only ours or theirs decide it in the block-based merge
+    const result = await makeResolver({strategy: "ours"}).resolveConflicts(content)
     assert.equal(result.resolved, true, result.errors.join(", "))
     assert.deepEqual(result.packageJson?.scripts, {test: 'node -e "console.log(1)"', build: "tsc"})
   })
@@ -474,7 +475,8 @@ describe("Fallback resolution of less common conflict shapes", () => {
       "}",
     ].join("\n")
 
-    const result = await makeResolver().resolveConflicts(content)
+    // No version to go by: ours keeps our side as a whole
+    const result = await makeResolver({strategy: "ours"}).resolveConflicts(content)
     assert.equal(result.resolved, true, result.errors.join(", "))
     assert.deepEqual(result.packageJson, {version: "1.0.0", files: ["dist"]})
   })

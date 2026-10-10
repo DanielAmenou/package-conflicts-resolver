@@ -6,6 +6,7 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 
 - **Automatic conflict resolution** with configurable strategies
 - **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`)
+- **No guessing on text** - a script, the description or any other value that is not a version, changed differently on both branches, is left for you between conflict markers around just that property, while everything else is merged (see [Values that are not versions](#values-that-are-not-versions))
 - **Smart version resolution** using semver (ranges, pre-releases, and non-registry specs like `workspace:`, `file:`, and git URLs are handled safely)
 - **List conflicted packages** - `--list` shows every package whose version conflicts, with our, their (and the base) version and what the resolution would keep, as a table or JSON (see [Listing conflicted packages](#listing-conflicted-packages))
 - **Pick versions per package** - `--pick lodash@4.17.21` resolves the packages you choose to the versions you choose, checked against the registry first, while the strategy resolves everything else (see [Choosing versions for specific packages](#choosing-versions-for-specific-packages))
@@ -94,6 +95,27 @@ With `highest`, a stable release beats a pre-release even when the pre-release h
 
 To decide some packages yourself instead, [pick their versions](#choosing-versions-for-specific-packages).
 
+#### Values that are not versions
+
+`highest` and `lowest` compare versions. A value that is not one, such as a script, the description, `main`, a boolean or an object, has no higher or lower side. When both branches changed it to different values, it is left for you to decide: everything else is merged, and package.json keeps Git conflict markers around just that property.
+
+```
+  "scripts": {
+<<<<<<< ours
+    "build": "tsc -b",
+=======
+    "build": "tsc && vite build",
+>>>>>>> theirs
+    "test": "jest"
+  },
+```
+
+The command lists these values and exits with code 1. Finish by editing them, or run again with `--strategy ours` or `--strategy theirs`, which decide them like any other conflict. Lockfiles are regenerated once package.json has no conflict markers left, since a package manager cannot read it before that.
+
+The merge driver does the same and exits 1, so Git stops before committing the merge: `git status` shows package.json as conflicted, with only those properties between markers.
+
+A lockfile never leaves values for you: it follows package.json, so it keeps ours, and npm rewrites it when the lockfile is regenerated.
+
 ### Listing conflicted packages
 
 See which packages conflict, what each branch wants, and what the resolution would keep, without changing any file:
@@ -128,7 +150,8 @@ Choose the version of a package with --pick <name>@<version>, for example --pick
 - **Where** is the dependency field of a declared range (`dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`; in a lockfile, `root › dependencies` is the project's own entry and `packages/web › dependencies` a workspace's), or the install location of a locked version (`node_modules/lodash`, `node_modules/debug/node_modules/ms`).
 - A **Base** column shows the common ancestor's version when the conflict markers carry it (`diff3`/`zdiff3` conflict style). Then a package only one branch changed is no conflict: it merges to that branch's version and is not listed.
 - **Resolved** follows `--strategy`, and previews `--pick` (marked `(picked)`).
-- With `--json`, the report is printed as a single JSON document: `{"strategy", "files": [{"file", "analyzed", "packages": [{"name", "kind", "location", "path", "ours", "theirs", "base"?, "resolved", "resolvedBy", "pick"?}], "otherConflicts": [{"field", "ours", "theirs", "resolved"}]}]}`. `kind` is `"spec"` for a declared range and `"lock"` for a locked version.
+- **Left for you to decide** lists the values both branches changed that are not versions, which a run leaves between conflict markers (see [Values that are not versions](#values-that-are-not-versions)).
+- With `--json`, the report is printed as a single JSON document: `{"strategy", "files": [{"file", "analyzed", "packages": [{"name", "kind", "location", "path", "ours", "theirs", "base"?, "resolved", "resolvedBy", "pick"?}], "otherConflicts": [{"field", "ours", "theirs", "resolved"}], "unresolved": [{"field", "ours", "theirs", "base"?}]}]}`. `kind` is `"spec"` for a declared range and `"lock"` for a locked version.
 
 Like a normal run, `--list` looks at the conflicted lockfiles next to a package.json. Conflicted `yarn.lock`, `pnpm-lock.yaml` and `bun.lock` files are mentioned but not analyzed, since their package manager resolves them. The command exits with code 1 only when a conflicted npm file cannot be analyzed, or when a `--pick` is invalid.
 
@@ -364,8 +387,13 @@ const resolver = new PackageResolver({
 
 const result = await resolver.resolveConflicts(conflictedContent)
 if (result.resolved && result.packageJson) {
-  await resolver.writeResolvedPackage(result.packageJson, "package.json")
+  // Formatted like the original; values left for you are written between conflict markers
+  await resolver.writeResolvedPackage(result.packageJson, "package.json", conflictedContent, result.unresolved)
 }
+
+// `result.unresolved` lists the values both branches changed that are not versions
+// (with highest and lowest): field, path, ours, theirs, and base when it is known.
+// `result.packageJson` holds our value in their place until you decide.
 
 // For lockfiles, `result.lockfileIssues` lists dependency edges the merged
 // lockfile does not satisfy (empty when it is consistent):
@@ -478,6 +506,10 @@ package-conflicts-resolver verify
 
 - The two branches' lockfiles cannot be combined into a graph that satisfies every dependency (the message lists the ones that fail). Run `npm install --package-lock-only`, then `git add package-lock.json` and finish the merge. See [Lockfile consistency](#lockfile-consistency).
 
+**"both branches changed ... not a version" during `git merge`**
+
+- Both branches changed a script, the description or another value that is not a version, so the merge driver left it for you between conflict markers; everything else is merged. Edit package.json, or run `package-conflicts-resolver --strategy ours` (or `theirs`), then `git add package.json` and finish the merge. See [Values that are not versions](#values-that-are-not-versions).
+
 **.gitattributes not working**
 
 - Make sure `.gitattributes` is committed to your repository.
@@ -495,6 +527,16 @@ package-conflicts-resolver verify
 - Node.js 20+
 - npm (for package-lock.json regeneration)
 - Git 2.0+
+
+## Development
+
+The project is developed on Node 24, as pinned in `.nvmrc`:
+
+```bash
+nvm use
+npm ci
+npm run check # format check, type check, build and tests
+```
 
 ## Support
 

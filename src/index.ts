@@ -33,7 +33,7 @@ export type {
 export {createNpmVersionLookup, parseNpmViewOutput} from "./registry.js"
 export type {NpmVersionLookupOptions, PackageVersionLookup, PackageVersions} from "./registry.js"
 export {formatConflictReport, reportFile} from "./conflict-report.js"
-export type {ConflictReport, ConflictReportFile, OtherConflict} from "./conflict-report.js"
+export type {ConflictReport, ConflictReportFile, OtherConflict, UnresolvedField} from "./conflict-report.js"
 
 // Every type of types.ts, and its two runtime values by name: unlike `export *`,
 // this compiles to plain re-exports, without a CommonJS helper

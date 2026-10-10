@@ -25,7 +25,14 @@ import {
   reportFile,
   unanalyzedFile,
 } from "./conflict-report.js"
-import {RESOLUTION_STRATEGIES, CliOptions, LockfileIssue, PackageJson, ResolutionResult} from "./types.js"
+import {
+  RESOLUTION_STRATEGIES,
+  CliOptions,
+  LockfileIssue,
+  PackageJson,
+  ResolutionResult,
+  UnresolvedConflict,
+} from "./types.js"
 
 const IS_WINDOWS = process.platform === "win32"
 
@@ -215,8 +222,21 @@ async function main() {
         const result = await resolver.mergeJsonContents(baseContent, currentContent, otherContent)
 
         if (result.resolved && result.packageJson) {
-          // Preserve the current file's indentation and line endings
-          await resolver.writeResolvedPackage(result.packageJson, current, currentContent)
+          // Preserve the current file's indentation and line endings; values left
+          // for the user to decide are written between conflict markers
+          const unresolved = result.unresolved ?? []
+          await resolver.writeResolvedPackage(result.packageJson, current, currentContent, unresolved)
+
+          // Those values are the user's to decide: a non-zero exit makes Git stop
+          // before it commits the merge, with only them between markers
+          if (unresolved.length > 0) {
+            const them = unresolved.length === 1 ? "it" : "them"
+            console.error(`package-conflicts-resolver: both branches changed ${describeUnresolved(unresolved)}`)
+            console.error(
+              `package-conflicts-resolver: left between conflict markers for you to decide; everything else is merged. Edit ${them}, or run package-conflicts-resolver --strategy ours (or theirs) on the file.`
+            )
+            return flushAndExit(1)
+          }
 
           // A merged lockfile can be valid JSON yet describe a dependency graph
           // npm refuses to install (`npm ci` fails with "not in sync"). The
@@ -330,6 +350,8 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
   const dir = dirname(resolve(filePath))
   let resolvedTarget = false
   let packageJsonDocument: PackageJson | undefined
+  // Values of the target both branches changed that are not versions, left for the user
+  let unresolved: UnresolvedConflict[] = []
   const inconsistent: InconsistentLockfile[] = []
 
   if (targetHasConflicts) {
@@ -347,8 +369,10 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     }
 
     if (result.packageJson) {
-      // Write resolved package.json (preserving original indentation/line endings)
-      await resolver.writeResolvedPackage(result.packageJson, filePath, content)
+      // Write resolved package.json (preserving original indentation/line endings),
+      // with conflict markers around the values left for the user to decide
+      unresolved = result.unresolved ?? []
+      await resolver.writeResolvedPackage(result.packageJson, filePath, content, unresolved)
       resolvedTarget = true
 
       if (targetIsPackageJson) {
@@ -365,12 +389,16 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     packageJsonDocument = parsePackageJson(content)
   }
 
+  // Package managers cannot read a package.json that still has conflict
+  // markers: lockfiles are not regenerated until the user has decided
+  const lockOptions: CliOptions = unresolved.length > 0 ? {...options, regenerateLock: false} : options
+
   // When the target is a package.json, also resolve conflicted sibling
   // lockfiles: Git conflicts often hit only the lockfile even when
   // package.json merges cleanly.
   let lockStatus: LockResolutionStatus = {resolved: 0, failed: [], inconsistent: [], regenerated: new Set()}
   if (targetIsPackageJson) {
-    lockStatus = await resolveCompanionLockfiles(filePath, options, packageJsonDocument)
+    lockStatus = await resolveCompanionLockfiles(filePath, lockOptions, packageJsonDocument)
   }
   inconsistent.push(...lockStatus.inconsistent)
 
@@ -400,7 +428,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
   let regenerated = new Set<string>(lockStatus.regenerated)
   if (
     (resolvedTarget || lockStatus.resolved > 0 || lockStatus.failed.length > 0) &&
-    options.regenerateLock &&
+    lockOptions.regenerateLock &&
     !options.dryRun
   ) {
     regenerated = await regenerateLockfiles(dir, options, lockStatus.regenerated)
@@ -437,8 +465,53 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     reportInconsistentLockfiles(inconsistent, options)
   }
 
-  const exitWithError = failed.length > 0 || (inconsistent.length > 0 && !options.dryRun)
+  if (unresolved.length > 0) {
+    await reportUnresolved(filePath, unresolved, options, dir)
+  }
+
+  const exitWithError = failed.length > 0 || (inconsistent.length > 0 && !options.dryRun) || unresolved.length > 0
   return flushAndExit(exitWithError ? 1 : 0)
+}
+
+/** "a value that is not a version: x", or "2 values that are not versions: x, y" */
+function describeUnresolved(unresolved: UnresolvedConflict[]): string {
+  const fields = unresolved.map(conflict => conflict.field).join(", ")
+  return unresolved.length === 1
+    ? `a value that is not a version: ${fields}`
+    : `${unresolved.length} values that are not versions: ${fields}`
+}
+
+/**
+ * Tell the user which values of the target were left for them to decide, and
+ * how to finish: they stay between conflict markers, and lockfiles wait.
+ */
+async function reportUnresolved(
+  filePath: string,
+  unresolved: UnresolvedConflict[],
+  options: CliOptions,
+  dir: string
+): Promise<void> {
+  const them = unresolved.length === 1 ? "it" : "them"
+  const lines = [
+    `Both branches changed ${describeUnresolved(unresolved)}`,
+    `   ${options.dryRun ? "Would leave" : "Left"} ${them} between conflict markers in ${filePath} for you to decide; everything else is merged.`,
+    `   Edit ${them}, or run again with --strategy ours or --strategy theirs.`,
+  ]
+  const lockfiles = options.regenerateLock && !options.dryRun ? await findLockfiles(dir) : []
+  if (lockfiles.length > 0) {
+    const commands = [...new Set(lockfiles.map(lockfile => `"${lockfile.manualCommand}"`))].join(" and ")
+    lines.push(`   Lockfiles were not regenerated: once ${filePath} is decided, run ${commands}.`)
+  }
+
+  const logger = new Logger({quiet: options.quiet, json: options.json, verbose: options.verbose})
+  logger.warn(lines.join("\n"), {
+    unresolved: unresolved.map(conflict => ({
+      field: conflict.field,
+      ours: conflict.ours,
+      theirs: conflict.theirs,
+      ...(conflict.base !== undefined ? {base: conflict.base} : {}),
+    })),
+  })
 }
 
 /**

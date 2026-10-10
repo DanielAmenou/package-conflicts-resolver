@@ -13,6 +13,7 @@ import {spawn} from "node:child_process"
 import {chmod, mkdir, mkdtemp, readFile, realpath, writeFile, rm} from "fs/promises"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
+import {conflictedDocument} from "./cli-harness.js"
 
 const CLI_PATH = join(__dirname, "..", "cli.js")
 
@@ -301,6 +302,29 @@ describe("npm lockfile regeneration", {skip: SKIP_ON_WINDOWS}, () => {
       },
       [] // no package managers installed at all
     )
+  })
+
+  test("a package.json left with values to decide is not handed to npm until they are decided", async () => {
+    await withHarness(async harness => {
+      const ours = {name: "app", scripts: {build: "tsc -b"}, dependencies: {foo: "^1.0.0"}}
+      const theirs = {name: "app", scripts: {build: "tsc && vite build"}, dependencies: {foo: "^1.2.0"}}
+      await writeFile(join(harness.dir, "package.json"), conflictedDocument(ours, theirs), "utf8")
+      await writeFile(join(harness.dir, "package-lock.json"), lock({foo: "^1.0.0"}, {foo: "1.5.0"}), "utf8")
+
+      // npm cannot read a package.json that still has conflict markers
+      const first = await harness.run([])
+      assert.equal(first.code, 1)
+      assert.deepEqual(await harness.invocations(), [])
+      assert.match(
+        first.stderr,
+        /Lockfiles were not regenerated: once package\.json is decided, run "npm install --package-lock-only"\./
+      )
+
+      // A strategy that picks a side decides the script, and the lockfile follows
+      const second = await harness.run(["--strategy", "ours"])
+      assert.equal(second.code, 0, second.stderr)
+      assert.deepEqual(await harness.invocations(), [`npm|${harness.dir}|install --package-lock-only`])
+    })
   })
 
   test("--no-regenerate-lock runs no package manager", async () => {
