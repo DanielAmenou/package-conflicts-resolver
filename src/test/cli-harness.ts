@@ -2,10 +2,11 @@
  * Helpers for tests that run the built CLI (and git) in temporary folders.
  */
 
-import {spawn} from "node:child_process"
+import {spawn, SpawnOptions} from "node:child_process"
 import {mkdtemp, realpath, rm} from "fs/promises"
 import {tmpdir} from "node:os"
 import {join} from "node:path"
+import {shellCommandLine} from "../process.js"
 
 export const CLI_PATH = join(__dirname, "..", "cli.js")
 
@@ -15,7 +16,7 @@ export interface RunResult {
   stderr: string
 }
 
-/** Run a command to completion; `shell` is for Windows .cmd shims such as npm.cmd (arguments are not quoted) */
+/** Run a command to completion; `shell` is for Windows .cmd shims such as npm.cmd */
 export function run(
   command: string,
   args: string[],
@@ -24,11 +25,15 @@ export function run(
   shell = false
 ): Promise<RunResult> {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(command, args, {cwd, env: {...process.env, ...env}, stdio: ["ignore", "pipe", "pipe"], shell})
+    const options: SpawnOptions = {cwd, env: {...process.env, ...env}, stdio: ["ignore", "pipe", "pipe"]}
+    // Quoted like the CLI quotes it: Node warns about arguments handed to a shell (DEP0190)
+    const child = shell
+      ? spawn(shellCommandLine(command, args), {...options, shell: true})
+      : spawn(command, args, options)
     let stdout = ""
     let stderr = ""
-    child.stdout.on("data", chunk => (stdout += chunk))
-    child.stderr.on("data", chunk => (stderr += chunk))
+    child.stdout!.on("data", chunk => (stdout += chunk))
+    child.stderr!.on("data", chunk => (stderr += chunk))
     child.on("error", reject)
     child.on("close", code => resolvePromise({code, stdout, stderr}))
   })
@@ -73,8 +78,17 @@ export async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T
   try {
     return await fn(dir)
   } finally {
-    await rm(dir, {recursive: true, force: true})
+    await removeDir(dir)
   }
+}
+
+/**
+ * Remove a temporary folder. On Windows a folder stays busy (EBUSY, EPERM)
+ * for a moment after the processes that used it exit, or while an antivirus
+ * scans the files they wrote: removal is retried for a few seconds.
+ */
+export function removeDir(dir: string): Promise<void> {
+  return rm(dir, {recursive: true, force: true, maxRetries: 10, retryDelay: 100})
 }
 
 /** A document conflicted as a whole: ours above, theirs below (and the base between them, diff3 style) */

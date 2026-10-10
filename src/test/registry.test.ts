@@ -6,12 +6,13 @@
 
 import {strict as assert} from "assert"
 import {test, describe, before, after} from "node:test"
-import {mkdtemp, rm} from "fs/promises"
+import {mkdtemp, readFile, writeFile} from "fs/promises"
 import {tmpdir} from "node:os"
-import {join} from "node:path"
+import {delimiter, join} from "node:path"
 import {createNpmVersionLookup, parseNpmViewOutput, DEFAULT_LOOKUP_TIMEOUT_MS} from "../registry.js"
-import {needsShell, runCommand} from "../process.js"
+import {needsShell, runCommand, shellCommandLine} from "../process.js"
 import {FakeRegistry, startFakeRegistry} from "./fake-registry.js"
+import {removeDir} from "./cli-harness.js"
 
 const ok = (stdout: string) => ({code: 0, stdout, stderr: ""})
 
@@ -111,7 +112,7 @@ describe("runCommand", () => {
       assert.equal(result.code, 0)
       assert.match(result.stdout, /set/)
     } finally {
-      await rm(dir, {recursive: true, force: true})
+      await removeDir(dir)
     }
   })
 
@@ -130,6 +131,75 @@ describe("runCommand", () => {
   test("a command that finishes in time is not affected by the timeout", async () => {
     const result = await runCommand(node, ["-e", "console.log('quick')"], {timeoutMs: 30000})
     assert.equal(result.stdout.trim(), "quick")
+  })
+
+  test("a package manager runs without a deprecation warning, through the Windows shell too", async () => {
+    // --throw-deprecation turns the warning Node 24 gives for arguments handed to a shell (DEP0190) into a failure
+    const processModule = JSON.stringify(join(__dirname, "..", "process.js"))
+    const script = `require(${processModule}).runCommand("npm", ["--version"]).then(result => process.exit(result.code))`
+    const result = await runCommand(node, ["--throw-deprecation", "-e", script])
+    assert.equal(result.code, 0, result.stderr)
+    assert.doesNotMatch(result.stderr, /DeprecationWarning|DEP0190/)
+  })
+
+  test(
+    "on timeout, a command run through the Windows shell is stopped with what it started",
+    {skip: process.platform !== "win32" && "only Windows runs package managers through a shell"},
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), "pcr-tree-"))
+      const pidFile = join(dir, "pid")
+      let pid: number | undefined
+      try {
+        // An npm shim that starts a node process, as npm.cmd does, which never ends by itself
+        const code = "require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000)"
+        await writeFile(join(dir, "npm.cmd"), `@"${process.execPath}" -e "${code}" "${pidFile}"\r\n`)
+        const pathKey = Object.keys(process.env).find(key => key.toUpperCase() === "PATH") ?? "PATH"
+        const env = {...process.env, [pathKey]: `${dir}${delimiter}${process.env[pathKey] ?? ""}`}
+
+        await assert.rejects(runCommand("npm", [], {env, timeoutMs: 3000}), {message: "timed out after 3s"})
+        pid = Number(await readFile(pidFile, "utf8"))
+        assert.throws(() => process.kill(pid as number, 0), {code: "ESRCH"}, "the node process must be stopped too")
+      } finally {
+        try {
+          if (pid !== undefined) process.kill(pid)
+        } catch {
+          // already stopped
+        }
+        await removeDir(dir)
+      }
+    }
+  )
+})
+
+describe("shellCommandLine", () => {
+  test("plain arguments go as they are", () => {
+    assert.equal(
+      shellCommandLine("npm", ["view", "@scope/pkg", "versions", "--json", "--fetch-retries=1"]),
+      "npm view @scope/pkg versions --json --fetch-retries=1"
+    )
+    assert.equal(shellCommandLine("pnpm", ["install", "--lockfile-only"]), "pnpm install --lockfile-only")
+  })
+
+  test("spaces and the characters cmd.exe interprets are kept literal between double quotes", () => {
+    assert.equal(
+      shellCommandLine("npm", ["view", "a b", "x&y", "^1.0.0", "(a)", "<b>|c", ""]),
+      'npm view "a b" "x&y" "^1.0.0" "(a)" "<b>|c" ""'
+    )
+  })
+
+  test("backslashes right before the closing quote are doubled, so that they do not escape it", () => {
+    assert.equal(shellCommandLine("npm", ["C:\\my dir\\"]), 'npm "C:\\my dir\\\\"')
+    assert.equal(shellCommandLine("npm", ["C:\\dir\\file"]), 'npm "C:\\dir\\file"')
+  })
+
+  test("refuses what cmd.exe cannot carry safely", () => {
+    for (const arg of ['say "hi"', "%PATH%", "wow!", "two\nlines", "carriage\rreturn"]) {
+      assert.throws(
+        () => shellCommandLine("npm", [arg]),
+        /cannot be passed to a command through the Windows shell/,
+        arg
+      )
+    }
   })
 })
 
@@ -170,7 +240,7 @@ describe("createNpmVersionLookup (real npm, fake registry)", () => {
       else process.env[key] = value
     }
     await registry.close()
-    await rm(dir, {recursive: true, force: true})
+    await removeDir(dir)
   })
 
   test("lists the published versions and dist-tags", async () => {

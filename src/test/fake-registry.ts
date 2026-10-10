@@ -100,7 +100,8 @@ export async function startFakeRegistry(packages: Record<string, FakePackage | s
     async close() {
       server.closeAllConnections()
       await new Promise(resolvePromise => server.close(resolvePromise))
-      await rm(home, {recursive: true, force: true})
+      // Retried: on Windows the folder stays busy for a moment after npm exits
+      await rm(home, {recursive: true, force: true, maxRetries: 10, retryDelay: 100})
     },
   }
 }
