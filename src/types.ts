@@ -51,22 +51,37 @@ export interface ResolvedConflict {
 }
 
 /**
- * A value of a package.json that both branches changed, to different values,
- * and that is not a version: a script, the description, a boolean, an
- * object... The highest and lowest strategies only order versions, so they
- * leave such a value for the user to decide: the merged document holds our
- * value in its place, and writeResolvedPackage() writes Git conflict markers
- * around the property, with both values. The ours and theirs strategies decide
- * it like any other conflict.
+ * Why a value was left for the user to decide:
+ * - "not-a-version": both branches changed it, and it is not a version (a
+ *   script, the description, a boolean, an object...)
+ * - "not-comparable": both branches changed a version spec, to specs that
+ *   have no order (a git URL and a range, two dist-tags, two file: paths...)
+ * - "removed": one branch removed it, and the other changed it. Never a
+ *   dependency: a dependency one branch removed stays removed (see
+ *   PackageConflict.resolvedBy).
+ */
+export type UnresolvedReason = "not-a-version" | "not-comparable" | "removed"
+
+/**
+ * A value of a package.json that the highest and lowest strategies cannot
+ * decide (see UnresolvedReason): they only order versions, and have no order
+ * for this value, or no way to tell whether it should still exist. It is
+ * left for the user to decide: the merged document holds our value in its
+ * place (nothing, when our branch removed it), and writeResolvedPackage()
+ * writes Git conflict markers around the property, with both values. The
+ * ours and theirs strategies, or a version picked for the package, decide it
+ * like any other conflict.
  */
 export interface UnresolvedConflict {
   /** The value's path joined with dots, like ResolvedConflict.field ("scripts.build") */
   field: string
   /** JSON path of the value */
   path: string[]
-  /** Our value */
+  /** Why the strategy did not decide it */
+  reason: UnresolvedReason
+  /** Our value: undefined when our branch removed it */
   ours: unknown
-  /** Their value */
+  /** Their value: undefined when their branch removed it */
   theirs: unknown
   /** The common ancestor's value, when it is known and had one */
   base?: unknown
@@ -93,15 +108,27 @@ export interface PackageConflict {
   location: string
   /** JSON path of the conflicting value inside the document */
   path: string[]
-  /** Our spec or locked version */
-  ours: string
-  /** Their spec or locked version */
-  theirs: string
+  /** Our spec or locked version: null when our branch removed it */
+  ours: string | null
+  /** Their spec or locked version: null when their branch removed it */
+  theirs: string | null
   /** The common ancestor's value, when it is known (merge driver, diff3/zdiff3 markers) */
   base?: string
-  /** The value the resolution kept */
-  resolved: string
-  /** What chose `resolved`: the strategy's name, or "pick" for a version the user picked */
+  /** The value the resolution kept: null when it removed it, or left it for the user to decide */
+  resolved: string | null
+  /**
+   * What chose `resolved`:
+   * - the strategy's name;
+   * - "pick", for a version the user picked;
+   * - "user", for a value left for the user to decide (it is among the
+   *   resolution's `unresolved` too);
+   * - "removal", for a dependency one branch removed while the other changed
+   *   it: with highest and lowest it stays removed (`resolved` is null), and
+   *   the other branch's change is dropped;
+   * - in a lockfile, "ours" or "theirs" when the strategy could not decide and
+   *   the side kept was the default: ours when the versions have no order, the
+   *   changed side for an installed entry the other branch removed.
+   */
   resolvedBy: string
   /** The version picked for this package, when there is one — even if it could not be applied here */
   pick?: string
@@ -148,8 +175,9 @@ export interface ResolutionResult {
   /**
    * Values left for the user to decide (see UnresolvedConflict). Set whenever
    * conflicts were resolved. The document still counts as `resolved`, with
-   * our value in place of each of these: pass them to writeResolvedPackage()
-   * so that the file gets conflict markers instead.
+   * our value in place of each of these (or nothing, where our branch removed
+   * it): pass them to writeResolvedPackage() so that the file gets conflict
+   * markers instead.
    */
   unresolved?: UnresolvedConflict[]
 }

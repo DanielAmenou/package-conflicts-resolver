@@ -107,7 +107,9 @@ export class ConflictParser {
   }
 
   /**
-   * Remove conflict markers and return clean content with resolved sections
+   * Replace each conflict with its resolution in `resolvedSections`, keyed by
+   * the line the conflict starts on. A conflict without a resolution is kept
+   * as it is, markers included: dropping it would lose both of its sides.
    */
   static removeConflictMarkers(content: string, resolvedSections: Map<number, string>): string {
     const lines = content.split("\n")
@@ -126,10 +128,10 @@ export class ConflictParser {
 
       // Add resolved content for this conflict
       const resolvedContent = resolvedSections.get(conflict.start)
-      if (resolvedContent !== undefined) {
-        if (resolvedContent.trim()) {
-          result.push(...resolvedContent.split("\n"))
-        }
+      if (resolvedContent === undefined) {
+        result.push(...lines.slice(conflict.start, conflict.end + 1))
+      } else if (resolvedContent.trim()) {
+        result.push(...resolvedContent.split("\n"))
       }
 
       lastProcessedLine = conflict.end + 1

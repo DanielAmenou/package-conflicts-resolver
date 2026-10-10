@@ -87,17 +87,76 @@ describe("reportFile", () => {
 
   test("values left for the user are listed with both sides, as text", () => {
     const unresolved: UnresolvedConflict[] = [
-      {field: "scripts.build", path: ["scripts", "build"], ours: "tsc -b", theirs: "tsc && vite build", base: "tsc"},
-      {field: "private", path: ["private"], ours: true, theirs: false},
-      {field: "exports", path: ["exports"], ours: "./index.js", theirs: {".": "./dist/index.js"}},
+      {
+        field: "scripts.build",
+        path: ["scripts", "build"],
+        reason: "not-a-version",
+        ours: "tsc -b",
+        theirs: "tsc && vite build",
+        base: "tsc",
+      },
+      {field: "private", path: ["private"], reason: "not-a-version", ours: true, theirs: false},
+      {
+        field: "exports",
+        path: ["exports"],
+        reason: "not-a-version",
+        ours: "./index.js",
+        theirs: {".": "./dist/index.js"},
+      },
     ]
     const report = reportFile("package.json", {...resolvedResult([field({})]), unresolved})
     assert.deepEqual(report.unresolved, [
-      {field: "scripts.build", ours: "tsc -b", theirs: "tsc && vite build", base: "tsc"},
-      {field: "private", ours: "true", theirs: "false"},
-      {field: "exports", ours: "./index.js", theirs: '{".":"./dist/index.js"}'},
+      {
+        field: "scripts.build",
+        path: ["scripts", "build"],
+        reason: "not-a-version",
+        ours: "tsc -b",
+        theirs: "tsc && vite build",
+        base: "tsc",
+      },
+      {field: "private", path: ["private"], reason: "not-a-version", ours: "true", theirs: "false"},
+      {
+        field: "exports",
+        path: ["exports"],
+        reason: "not-a-version",
+        ours: "./index.js",
+        theirs: '{".":"./dist/index.js"}',
+      },
     ])
     assert.deepEqual(report.otherConflicts, [{field: "version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"}])
+  })
+
+  test("a side that removed a value is reported as null, a value that is null as text", () => {
+    const unresolved: UnresolvedConflict[] = [
+      {
+        field: "scripts.lint",
+        path: ["scripts", "lint"],
+        reason: "removed",
+        ours: undefined,
+        theirs: "eslint .",
+        base: "x",
+      },
+      {field: "funding", path: ["funding"], reason: "removed", ours: null, theirs: undefined, base: "x"},
+      {
+        field: "dependencies.foo",
+        path: ["dependencies", "foo"],
+        reason: "not-comparable",
+        ours: "file:../a",
+        theirs: "^1.0.0",
+      },
+    ]
+    const report = reportFile("package.json", {...resolvedResult([]), unresolved})
+    assert.deepEqual(report.unresolved, [
+      {field: "scripts.lint", path: ["scripts", "lint"], reason: "removed", ours: null, theirs: "eslint .", base: "x"},
+      {field: "funding", path: ["funding"], reason: "removed", ours: "null", theirs: null, base: "x"},
+      {
+        field: "dependencies.foo",
+        path: ["dependencies", "foo"],
+        reason: "not-comparable",
+        ours: "file:../a",
+        theirs: "^1.0.0",
+      },
+    ])
   })
 
   test("a result without unresolved values reports none", () => {
@@ -277,8 +336,14 @@ describe("formatConflictReport", () => {
           packages: [],
           otherConflicts: [{field: "version", ours: "1.1.0", theirs: "1.2.0", resolved: "1.2.0"}],
           unresolved: [
-            {field: "scripts.build", ours: "tsc -b", theirs: `vite build ${"x".repeat(40)}`},
-            {field: "private", ours: "true", theirs: "false"},
+            {
+              field: "scripts.build",
+              path: ["scripts", "build"],
+              reason: "not-a-version",
+              ours: "tsc -b",
+              theirs: `vite build ${"x".repeat(40)}`,
+            },
+            {field: "private", path: ["private"], reason: "not-a-version", ours: "true", theirs: "false"},
           ],
         },
       ],
@@ -290,8 +355,121 @@ describe("formatConflictReport", () => {
       "",
       `   Left for you to decide: scripts.build (ours tsc -b, theirs vite build ${"x".repeat(28)}…), private (ours true, theirs false)`,
       "",
-      "Values left for you to decide are not versions: resolving keeps them between conflict markers, unless you use --strategy ours or --strategy theirs",
+      "Values left for you to decide stay between conflict markers when resolving, unless you use --strategy ours or --strategy theirs (or --pick, for a package)",
     ])
+  })
+
+  test("a removed side reads as removed, and packages left for the user are only in the table", () => {
+    const lines = formatConflictReport({
+      strategy: "highest",
+      files: [
+        {
+          file: "package.json",
+          analyzed: true,
+          packages: [
+            pkg({ours: null, base: "^4.17.20", resolved: null, resolvedBy: "user"}),
+            pkg({
+              name: "react",
+              path: ["dependencies", "react"],
+              ours: "^18.3.0",
+              theirs: null,
+              base: "^18.2.0",
+              resolved: null,
+              resolvedBy: "ours",
+            }),
+            pkg({
+              name: "zod",
+              path: ["dependencies", "zod"],
+              ours: "github:u/zod#v3",
+              theirs: "^3.23.0",
+              base: "^3.22.0",
+              resolved: null,
+              resolvedBy: "user",
+            }),
+          ],
+          otherConflicts: [],
+          unresolved: [
+            {
+              field: "dependencies.lodash",
+              path: ["dependencies", "lodash"],
+              reason: "removed",
+              ours: null,
+              theirs: "^4.17.21",
+            },
+            {field: "scripts.lint", path: ["scripts", "lint"], reason: "removed", ours: "eslint .", theirs: null},
+            {
+              field: "dependencies.zod",
+              path: ["dependencies", "zod"],
+              reason: "not-comparable",
+              ours: "x",
+              theirs: "y",
+            },
+          ],
+        },
+      ],
+    })
+    assert.deepEqual(lines, [
+      "📋 package.json: 3 conflicted packages (strategy: highest)",
+      "",
+      "   Package  Where         Ours             Theirs     Base      Resolved",
+      "   lodash   dependencies  (removed)        ^4.17.21   ^4.17.20  (left for you)",
+      "   react    dependencies  ^18.3.0          (removed)  ^18.2.0   (removed)",
+      "   zod      dependencies  github:u/zod#v3  ^3.23.0    ^3.22.0   (left for you)",
+      "",
+      "   Left for you to decide: scripts.lint (ours eslint ., theirs removed)",
+      "",
+      // The example is a package left for the user, with the version that is there
+      "Choose the version of a package with --pick <name>@<version>, for example --pick lodash@^4.17.21",
+      "Values left for you to decide stay between conflict markers when resolving, unless you use --strategy ours or --strategy theirs (or --pick, for a package)",
+    ])
+  })
+
+  test("a dependency kept removed reads as removed, with a hint on how to keep it", () => {
+    const lines = formatConflictReport({
+      strategy: "highest",
+      files: [
+        {
+          file: "package.json",
+          analyzed: true,
+          packages: [
+            pkg({name: "a", path: ["dependencies", "a"], ours: "^1.0.0", theirs: "^1.1.0", resolved: "^1.1.0"}),
+            pkg({ours: null, base: "^4.17.20", resolved: null, resolvedBy: "removal"}),
+          ],
+          otherConflicts: [],
+          unresolved: [],
+        },
+      ],
+    })
+    assert.deepEqual(lines, [
+      "📋 package.json: 2 conflicted packages (strategy: highest)",
+      "",
+      "   Package  Where         Ours       Theirs    Base      Resolved",
+      "   a        dependencies  ^1.0.0     ^1.1.0    -         ^1.1.0",
+      "   lodash   dependencies  (removed)  ^4.17.21  ^4.17.20  (removed)",
+      "",
+      // The example keeps the removed dependency
+      "Choose the version of a package with --pick <name>@<version>, for example --pick lodash@^4.17.21",
+      "A dependency one branch removed stays removed, without the other branch's change: pick a version to keep it",
+    ])
+  })
+
+  test("the pick example falls back to our version when theirs was removed", () => {
+    const lines = formatConflictReport({
+      strategy: "highest",
+      files: [
+        {
+          file: "package.json",
+          analyzed: true,
+          packages: [pkg({theirs: null, resolved: null, resolvedBy: "user"})],
+          otherConflicts: [],
+          unresolved: [],
+        },
+      ],
+    })
+    assert.equal(
+      lines[lines.length - 1],
+      "Choose the version of a package with --pick <name>@<version>, for example --pick lodash@^4.17.19"
+    )
   })
 
   test("no hint without packages, and a message when nothing is conflicted", () => {

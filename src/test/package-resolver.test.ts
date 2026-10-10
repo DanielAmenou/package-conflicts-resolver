@@ -148,7 +148,7 @@ describe("PackageResolver", () => {
     assert.equal(result.conflicts.length, 0)
     // A script is no version: "highest" cannot choose between jest and mocha
     assert.deepEqual(result.unresolved, [
-      {field: "scripts.test", path: ["scripts", "test"], ours: "jest", theirs: "mocha"},
+      {field: "scripts.test", path: ["scripts", "test"], reason: "not-a-version", ours: "jest", theirs: "mocha"},
     ])
 
     const scripts = result.packageJson?.scripts

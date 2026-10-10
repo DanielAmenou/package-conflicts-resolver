@@ -538,3 +538,60 @@ describe("Fallback resolution of less common conflict shapes", () => {
     assert.deepEqual(result.packageJson, {name: "app", version: "1.2.0"})
   })
 })
+
+describe("Fallback resolution of a block it fails on", () => {
+  // Our side has a comment, so the semantic merge cannot read the document
+  const content = [
+    "{",
+    '  "name": "app",',
+    "<<<<<<< HEAD",
+    '  "version": "1.1.0", // ours',
+    "=======",
+    '  "version": "1.2.0",',
+    ">>>>>>> feature",
+    '  "dependencies": {',
+    "<<<<<<< HEAD",
+    '    "lodash": "^4.17.21"',
+    "=======",
+    '    "lodash": "^4.17.20"',
+    ">>>>>>> feature",
+    "  }",
+    "}",
+  ].join("\n")
+
+  test("the document resolves when every block does", async () => {
+    const result = await makeResolver().resolveConflicts(content)
+    assert.equal(result.resolved, true, result.errors.join(", "))
+    assert.deepEqual(result.packageJson, {name: "app", version: "1.2.0", dependencies: {lodash: "^4.17.21"}})
+  })
+
+  test("a block that fails fails the whole resolution, naming its line, instead of being dropped", async () => {
+    const resolver = makeResolver()
+    // Stands in for any input a block resolver did not foresee
+    ;(resolver as any).resolveDependencyConflict = () => {
+      throw new Error("unexpected input")
+    }
+
+    const result = await resolver.resolveConflicts(content)
+    assert.equal(result.resolved, false)
+    assert.deepEqual(result.errors, ["Failed to resolve conflict at line 9: unexpected input"])
+    assert.equal(result.packageJson, undefined, "no document comes out without the block")
+  })
+
+  test("every failing block is reported, while the others still resolve", async () => {
+    const resolver = makeResolver()
+    ;(resolver as any).resolveSimpleConflict = () => {
+      throw new Error("first")
+    }
+    ;(resolver as any).resolveDependencyConflict = () => {
+      throw new Error("second")
+    }
+
+    const result = await resolver.resolveConflicts(content)
+    assert.equal(result.resolved, false)
+    assert.deepEqual(result.errors, [
+      "Failed to resolve conflict at line 3: first",
+      "Failed to resolve conflict at line 9: second",
+    ])
+  })
+})

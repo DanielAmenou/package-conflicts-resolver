@@ -131,14 +131,21 @@ describe("VersionResolver", () => {
       assert.equal(VersionResolver.resolveVersion("^1.2.3", "1.2.3", "lowest").resolved, "1.2.3", "exact wins")
     })
 
-    test("falls back to coerced comparison for near-semver strings", () => {
-      assert.equal(VersionResolver.resolveVersion("v1.2", "1.3.0.0", "lowest").resolved, "v1.2")
-      assert.equal(VersionResolver.resolveVersion("1.3.0.0", "v1.2", "lowest").resolved, "v1.2")
+    test("finds no order for near-semver strings, rather than guess one from their digits", () => {
+      for (const [ours, theirs] of [
+        ["v1.2", "1.3.0.0"],
+        ["1.3.0.0", "v1.2"],
+      ] as const) {
+        const result = VersionResolver.resolveVersion(ours, theirs, "lowest")
+        assert.equal(result.resolved, ours)
+        assert.equal(result.comparable, false)
+      }
     })
 
     test("keeps ours for non-comparable specs", () => {
       const result = VersionResolver.resolveVersion("workspace:*", "file:../lib", "lowest")
       assert.equal(result.resolved, "workspace:*")
+      assert.equal(result.comparable, false)
       assert(result.reason.includes("not comparable"))
     })
   })
@@ -150,9 +157,15 @@ describe("VersionResolver", () => {
       assert.equal(VersionResolver.resolveVersion("~1.2.3", "^1.2.3", "highest").resolved, "~1.2.3")
     })
 
-    test("falls back to coerced comparison for near-semver strings", () => {
-      assert.equal(VersionResolver.resolveVersion("v1.2", "1.3.0.0", "highest").resolved, "1.3.0.0")
-      assert.equal(VersionResolver.resolveVersion("1.3.0.0", "v1.2", "highest").resolved, "1.3.0.0")
+    test("finds no order for near-semver strings, rather than guess one from their digits", () => {
+      for (const [ours, theirs] of [
+        ["v1.2", "1.3.0.0"],
+        ["1.3.0.0", "v1.2"],
+      ] as const) {
+        const result = VersionResolver.resolveVersion(ours, theirs, "highest")
+        assert.equal(result.resolved, ours)
+        assert.equal(result.comparable, false)
+      }
     })
 
     test("wildcard and x-ranges compare by minimum", () => {
@@ -163,14 +176,16 @@ describe("VersionResolver", () => {
     test("keeps ours for non-comparable specs", () => {
       const result = VersionResolver.resolveVersion("workspace:*", "npm:lodash@4", "highest")
       assert.equal(result.resolved, "workspace:*")
+      assert.equal(result.comparable, false)
       assert(result.reason.includes("not comparable"))
     })
 
-    test("an unsatisfiable range is compared by the version it names", () => {
+    test("an unsatisfiable range has no minimum, so no order", () => {
       // A valid range that no version satisfies has no minimum to compare by
       const result = VersionResolver.resolveVersion(">2.0.0 <1.0.0", "^1.5.0", "highest")
       assert.equal(result.resolved, ">2.0.0 <1.0.0")
-      assert.match(result.reason, /is higher than 1\.5\.0/)
+      assert.equal(result.comparable, false)
+      assert.match(result.reason, /not comparable/)
     })
 
     test("prerelease-only comparison keeps semver ordering", () => {

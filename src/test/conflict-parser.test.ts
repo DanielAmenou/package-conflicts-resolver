@@ -172,3 +172,52 @@ describe("ConflictParser", () => {
     assert.equal(ConflictParser.parsePartialJson('"^1.0.0"'), "^1.0.0")
   })
 })
+
+describe("ConflictParser.removeConflictMarkers", () => {
+  const content = [
+    "{",
+    "<<<<<<< HEAD",
+    '  "a": 1,',
+    "=======",
+    '  "a": 2,',
+    ">>>>>>> feature",
+    "<<<<<<< HEAD",
+    '  "b": 1',
+    "=======",
+    '  "b": 2',
+    ">>>>>>> feature",
+    "}",
+  ].join("\n")
+
+  test("replaces each conflict with its resolution", () => {
+    const resolved = new Map([
+      [1, '  "a": 3,'],
+      [6, '  "b": 3'],
+    ])
+    assert.equal(
+      ConflictParser.removeConflictMarkers(content, resolved),
+      ["{", '  "a": 3,', '  "b": 3', "}"].join("\n")
+    )
+  })
+
+  test("keeps a conflict it has no resolution for, markers included, rather than lose both sides", () => {
+    assert.equal(
+      ConflictParser.removeConflictMarkers(content, new Map([[1, '  "a": 3,']])),
+      ["{", '  "a": 3,', "<<<<<<< HEAD", '  "b": 1', "=======", '  "b": 2', ">>>>>>> feature", "}"].join("\n")
+    )
+    assert.equal(ConflictParser.removeConflictMarkers(content, new Map()), content)
+  })
+
+  test("an empty resolution removes the conflict", () => {
+    assert.equal(
+      ConflictParser.removeConflictMarkers(
+        content,
+        new Map([
+          [1, ""],
+          [6, '  "b": 3'],
+        ])
+      ),
+      ["{", '  "b": 3', "}"].join("\n")
+    )
+  })
+})

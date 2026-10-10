@@ -24,11 +24,13 @@ import {
   formatConflictReport,
   reportFile,
   unanalyzedFile,
+  unresolvedField,
 } from "./conflict-report.js"
 import {
   RESOLUTION_STRATEGIES,
   CliOptions,
   LockfileIssue,
+  PackageConflict,
   PackageJson,
   ResolutionResult,
   UnresolvedConflict,
@@ -227,13 +229,24 @@ async function main() {
           const unresolved = result.unresolved ?? []
           await resolver.writeResolvedPackage(result.packageJson, current, currentContent, unresolved)
 
+          // A dependency one branch removed stays removed: say whose change that dropped
+          for (const conflict of droppedChanges(result)) {
+            console.error(`package-conflicts-resolver: ${describeDroppedChange(conflict)}`)
+          }
+
           // Those values are the user's to decide: a non-zero exit makes Git stop
           // before it commits the merge, with only them between markers
           if (unresolved.length > 0) {
             const them = unresolved.length === 1 ? "it" : "them"
-            console.error(`package-conflicts-resolver: both branches changed ${describeUnresolved(unresolved)}`)
+            const pick = hasPickableConflicts(result) ? "--pick <package>@<version> or " : ""
             console.error(
-              `package-conflicts-resolver: left between conflict markers for you to decide; everything else is merged. Edit ${them}, or run package-conflicts-resolver --strategy ours (or theirs) on the file.`
+              `package-conflicts-resolver: left ${countValues(unresolved)} between conflict markers for you to decide:`
+            )
+            for (const conflict of unresolved) {
+              console.error(`  - ${describeUnresolved(conflict)}`)
+            }
+            console.error(
+              `package-conflicts-resolver: everything else is merged. Edit ${them}, or run package-conflicts-resolver ${pick}--strategy ours (or theirs) on the file.`
             )
             return flushAndExit(1)
           }
@@ -350,8 +363,12 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
   const dir = dirname(resolve(filePath))
   let resolvedTarget = false
   let packageJsonDocument: PackageJson | undefined
-  // Values of the target both branches changed that are not versions, left for the user
+  // Values of the target the strategy cannot decide, left for the user
   let unresolved: UnresolvedConflict[] = []
+  // Whether package specs are among them, which a version picked for the package decides
+  let pickable = false
+  // Dependencies of the target one branch removed while the other changed them: they stay removed
+  let dropped: PackageConflict[] = []
   const inconsistent: InconsistentLockfile[] = []
 
   if (targetHasConflicts) {
@@ -372,6 +389,8 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
       // Write resolved package.json (preserving original indentation/line endings),
       // with conflict markers around the values left for the user to decide
       unresolved = result.unresolved ?? []
+      pickable = hasPickableConflicts(result)
+      dropped = droppedChanges(result)
       await resolver.writeResolvedPackage(result.packageJson, filePath, content, unresolved)
       resolvedTarget = true
 
@@ -465,20 +484,82 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
     reportInconsistentLockfiles(inconsistent, options)
   }
 
+  if (dropped.length > 0) {
+    reportDroppedChanges(filePath, dropped, options)
+  }
+
   if (unresolved.length > 0) {
-    await reportUnresolved(filePath, unresolved, options, dir)
+    await reportUnresolved(filePath, unresolved, pickable, options, dir)
   }
 
   const exitWithError = failed.length > 0 || (inconsistent.length > 0 && !options.dryRun) || unresolved.length > 0
   return flushAndExit(exitWithError ? 1 : 0)
 }
 
-/** "a value that is not a version: x", or "2 values that are not versions: x, y" */
-function describeUnresolved(unresolved: UnresolvedConflict[]): string {
-  const fields = unresolved.map(conflict => conflict.field).join(", ")
-  return unresolved.length === 1
-    ? `a value that is not a version: ${fields}`
-    : `${unresolved.length} values that are not versions: ${fields}`
+/** "a value", or "3 values" */
+function countValues(unresolved: UnresolvedConflict[]): string {
+  return unresolved.length === 1 ? "a value" : `${unresolved.length} values`
+}
+
+/** A value left for the user, and why: "scripts.build: both branches changed it, and it is not a version" */
+function describeUnresolved(conflict: UnresolvedConflict): string {
+  switch (conflict.reason) {
+    case "removed":
+      return conflict.ours === undefined
+        ? `${conflict.field}: our branch removed it, their branch changed it`
+        : `${conflict.field}: their branch removed it, our branch changed it`
+    case "not-comparable":
+      return `${conflict.field}: both branches changed it, to versions that cannot be compared (${String(conflict.ours)} and ${String(conflict.theirs)})`
+    default:
+      return `${conflict.field}: both branches changed it, and it is not a version`
+  }
+}
+
+/**
+ * Dependencies of a package.json that one branch removed while the other
+ * changed them: they stay removed, and that change is dropped. None for a
+ * lockfile, which follows package.json.
+ */
+function droppedChanges(result: ResolutionResult): PackageConflict[] {
+  if (isNpmLockfile(result.packageJson)) {
+    return []
+  }
+  return (result.packageConflicts ?? []).filter(conflict => conflict.resolvedBy === "removal")
+}
+
+/** "dependencies.lodash: our branch removed it, their change to ^4.17.21 was dropped" */
+function describeDroppedChange(conflict: PackageConflict): string {
+  const field = conflict.path.join(".")
+  return conflict.ours === null
+    ? `${field}: our branch removed it, their change to ${conflict.theirs} was dropped`
+    : `${field}: their branch removed it, our change to ${conflict.ours} was dropped`
+}
+
+/** Tell the user which dependencies stayed removed, and whose change that dropped */
+function reportDroppedChanges(filePath: string, dropped: PackageConflict[], options: CliOptions): void {
+  const one = dropped.length === 1
+  const stay = options.dryRun ? "would stay" : one ? "stays" : "stay"
+  const lines = [
+    `${one ? "A dependency" : `${dropped.length} dependencies`} one branch removed ${stay} removed in ${filePath}, without the other branch's ${one ? "change" : "changes"}:`,
+    ...dropped.map(conflict => `   - ${describeDroppedChange(conflict)}`),
+    `   ${one ? "Add it back if it is still needed." : "Add back any that are still needed."}`,
+  ]
+
+  const logger = new Logger({quiet: options.quiet, json: options.json, verbose: options.verbose})
+  logger.warn(lines.join("\n"), {
+    droppedChanges: dropped.map(conflict => ({
+      field: conflict.path.join("."),
+      package: conflict.name,
+      removedBy: conflict.ours === null ? "ours" : "theirs",
+      change: conflict.ours ?? conflict.theirs,
+      base: conflict.base,
+    })),
+  })
+}
+
+/** Whether package specs are among the values left for the user: picking a version decides those */
+function hasPickableConflicts(result: ResolutionResult): boolean {
+  return (result.packageConflicts ?? []).some(conflict => conflict.resolvedBy === "user")
 }
 
 /**
@@ -488,14 +569,15 @@ function describeUnresolved(unresolved: UnresolvedConflict[]): string {
 async function reportUnresolved(
   filePath: string,
   unresolved: UnresolvedConflict[],
+  pickable: boolean,
   options: CliOptions,
   dir: string
 ): Promise<void> {
   const them = unresolved.length === 1 ? "it" : "them"
   const lines = [
-    `Both branches changed ${describeUnresolved(unresolved)}`,
-    `   ${options.dryRun ? "Would leave" : "Left"} ${them} between conflict markers in ${filePath} for you to decide; everything else is merged.`,
-    `   Edit ${them}, or run again with --strategy ours or --strategy theirs.`,
+    `${options.dryRun ? "Would leave" : "Left"} ${countValues(unresolved)} between conflict markers in ${filePath} for you to decide:`,
+    ...unresolved.map(conflict => `   - ${describeUnresolved(conflict)}`),
+    `   Everything else is merged. Edit ${them}, or run again with ${pickable ? "--pick <package>@<version>, " : ""}--strategy ours or --strategy theirs.`,
   ]
   const lockfiles = options.regenerateLock && !options.dryRun ? await findLockfiles(dir) : []
   if (lockfiles.length > 0) {
@@ -504,14 +586,7 @@ async function reportUnresolved(
   }
 
   const logger = new Logger({quiet: options.quiet, json: options.json, verbose: options.verbose})
-  logger.warn(lines.join("\n"), {
-    unresolved: unresolved.map(conflict => ({
-      field: conflict.field,
-      ours: conflict.ours,
-      theirs: conflict.theirs,
-      ...(conflict.base !== undefined ? {base: conflict.base} : {}),
-    })),
-  })
+  logger.warn(lines.join("\n"), {unresolved: unresolved.map(unresolvedField)})
 }
 
 /**

@@ -2,166 +2,226 @@
  * Version resolution strategies using semver
  */
 
-import {coerce, compare, minVersion, prerelease, valid, validRange, type SemVer} from "semver"
+import {compare, minVersion, prerelease, valid, validRange, type SemVer} from "semver"
 import {ResolutionStrategy} from "./types.js"
+import {classifyVersionSpec} from "./version-picks.js"
+
+/** How a conflict between two version specs was resolved */
+export interface VersionResolution {
+  /** One of the two specs, verbatim */
+  resolved: string
+  /** Why that one */
+  reason: string
+  /**
+   * Whether the strategy could decide. False when highest or lowest finds no
+   * order between the specs, because they point at different things or at
+   * something that has no version: a git URL and a range, two dist-tags, two
+   * tarballs, a file: path... `resolved` is then just our spec, kept by
+   * default. Always true for ours and theirs.
+   */
+  comparable: boolean
+}
+
+/** The side a comparison chose, and why */
+interface Order {
+  winner: "ours" | "theirs"
+  reason: string
+}
+
+/** What a spec selects a version of, and the part of it semver can order */
+interface VersionTarget {
+  /** "" for a registry version of the package itself, "npm:<name>" for an alias, "git:<repository>"... */
+  target: string
+  /** The version or range: the whole spec, or what follows the target */
+  spec: string
+}
+
+/** npm:<name>@<version or range> */
+const ALIAS = /^npm:((?:@[^@/\s]+\/)?[^@/\s]+)@(\S.*)$/
+/** corepack's "packageManager" field: <name>@<version> */
+const PACKAGE_MANAGER = /^((?:@[^@/\s]+\/)?[^@/\s]+)@(\S+)$/
 
 export class VersionResolver {
   /**
    * Resolve version conflict using the specified strategy.
-   * Never throws: falls back to keeping our version for non-comparable specs
-   * (git URLs, file:, link:, workspace:, npm: aliases, dist-tags, etc.).
+   * Never throws: specs that highest and lowest cannot order (git URLs, file:,
+   * dist-tags, aliases of different packages...) keep our version, with
+   * `comparable` false.
    */
   static resolveVersion(
     ourVersion: string,
     theirVersion: string,
     strategy: ResolutionStrategy["name"]
-  ): {resolved: string; reason: string} {
+  ): VersionResolution {
     try {
       switch (strategy) {
         case "ours":
-          return {resolved: ourVersion, reason: "using our version (ours strategy)"}
+          return {resolved: ourVersion, reason: "using our version (ours strategy)", comparable: true}
         case "theirs":
-          return {resolved: theirVersion, reason: "using their version (theirs strategy)"}
+          return {resolved: theirVersion, reason: "using their version (theirs strategy)", comparable: true}
         case "lowest":
-          return this.resolveLowest(ourVersion, theirVersion)
+          return this.resolveOrdered(ourVersion, theirVersion, "lowest")
         case "highest":
         default:
-          return this.resolveHighest(ourVersion, theirVersion)
+          return this.resolveOrdered(ourVersion, theirVersion, "highest")
       }
     } catch {
-      return {resolved: ourVersion, reason: "version comparison failed, keeping our version"}
+      return {resolved: ourVersion, reason: "version comparison failed, keeping our version", comparable: false}
     }
   }
 
   /**
-   * Resolve to highest version
+   * Resolve with highest or lowest: order the parts of the two specs that
+   * semver understands, and return the winning spec verbatim.
    */
-  private static resolveHighest(ourVersion: string, theirVersion: string): {resolved: string; reason: string} {
-    const ourClean = this.cleanVersion(ourVersion)
-    const theirClean = this.cleanVersion(theirVersion)
-
+  private static resolveOrdered(
+    ourVersion: string,
+    theirVersion: string,
+    strategy: "highest" | "lowest"
+  ): VersionResolution {
     // Only identical raw specs short-circuit: "^1.2.3" and "~1.2.3" share a
     // base version but are different ranges and must go through resolution
     if (ourVersion.trim() === theirVersion.trim()) {
-      return {resolved: ourVersion, reason: "versions are identical"}
+      return {resolved: ourVersion, reason: "versions are identical", comparable: true}
     }
+
+    const specs = this.comparableSpecs(ourVersion, theirVersion)
+    const order =
+      specs === null ? null : strategy === "highest" ? this.orderHighest(...specs) : this.orderLowest(...specs)
+    if (order === null) {
+      return {
+        resolved: ourVersion,
+        reason: `versions are not comparable ("${ourVersion}" vs "${theirVersion}"), keeping our version`,
+        comparable: false,
+      }
+    }
+    return {resolved: order.winner === "ours" ? ourVersion : theirVersion, reason: order.reason, comparable: true}
+  }
+
+  /**
+   * The parts of two specs that semver can order, when both select a version
+   * of the same thing: the specs themselves for registry versions and ranges,
+   * or what follows what they point at, for npm: aliases of the same package,
+   * workspace: specs, git specs of the same repository (a tag that is a
+   * version, or a semver: range) and corepack specs of the same package
+   * manager. Null when they point at different things, or one of them at
+   * something that has no version: a file, a tarball, a dist-tag, a branch.
+   * Never are digits picked out of a spec to compare it: a commit hash or a
+   * tarball name is no version.
+   */
+  private static comparableSpecs(ourVersion: string, theirVersion: string): [string, string] | null {
+    const ours = this.versionTarget(ourVersion)
+    const theirs = this.versionTarget(theirVersion)
+    return ours !== null && theirs !== null && ours.target === theirs.target ? [ours.spec, theirs.spec] : null
+  }
+
+  private static versionTarget(spec: string): VersionTarget | null {
+    const text = spec.trim()
+
+    const alias = ALIAS.exec(text)
+    if (alias !== null) {
+      return {target: `npm:${alias[1]}`, spec: alias[2] as string}
+    }
+    if (text.startsWith("workspace:")) {
+      const range = text.slice("workspace:".length)
+      return range !== "" ? {target: "workspace:", spec: range} : null
+    }
+
+    const type = classifyVersionSpec(text)?.type
+    if (type === "git") {
+      const hash = text.indexOf("#")
+      const ref = hash === -1 ? "" : text.slice(hash + 1).replace(/^semver:/, "")
+      return ref !== "" ? {target: `git:${text.slice(0, hash)}`, spec: ref} : null
+    }
+    if (type === "version" || type === "range") {
+      return {target: "", spec: text}
+    }
+    if (type !== undefined) {
+      // A file, a tarball URL, a dist-tag, an alias without a version, another protocol
+      return null
+    }
+
+    const manager = PACKAGE_MANAGER.exec(text)
+    if (manager !== null) {
+      return {target: `manager:${manager[1]}`, spec: manager[2] as string}
+    }
+    // Not a spec npm reads: semver may still make sense of it, loosely
+    return {target: "", spec: text}
+  }
+
+  /**
+   * Order two specs for the highest strategy, or null when semver cannot.
+   */
+  private static orderHighest(ours: string, theirs: string): Order | null {
+    const ourClean = this.cleanVersion(ours)
+    const theirClean = this.cleanVersion(theirs)
 
     // 1. Direct semver comparison, only when both specs are exact versions —
     // comparing cleaned ranges here would erase range semantics ("^" vs "~")
-    if (valid(ourVersion.trim()) && valid(theirVersion.trim())) {
+    if (valid(ours.trim()) && valid(theirs.trim())) {
       const comparison = this.compareForHighest(ourClean, theirClean)
       if (comparison > 0) {
-        return {resolved: ourVersion, reason: this.describeHigher(ourClean, theirClean, "our", "their")}
+        return {winner: "ours", reason: this.describeHigher(ourClean, theirClean, "our", "their")}
       } else if (comparison < 0) {
-        return {resolved: theirVersion, reason: this.describeHigher(theirClean, ourClean, "their", "our")}
-      } else {
-        return {resolved: ourVersion, reason: "versions are identical"}
+        return {winner: "theirs", reason: this.describeHigher(theirClean, ourClean, "their", "our")}
       }
+      return {winner: "ours", reason: "versions are identical"}
     }
 
     // 2. Compare as semver ranges (handles "*", "1.x", ">=1.0.0 <2.0.0", "1.2.3 - 2.0.0", ...)
     // by their minimum satisfying versions, with the same stable-over-pre-release
     // rule as exact versions so a package.json range and the exact version locked
     // for it in package-lock.json always resolve to the same side.
-    const minimums = this.rangeMinimums(ourVersion, theirVersion)
+    const minimums = this.rangeMinimums(ours, theirs)
     if (minimums !== null) {
       const rangeComparison = this.compareForHighest(minimums.ours, minimums.theirs)
       if (rangeComparison > 0) {
-        return {resolved: ourVersion, reason: `our range ${ourVersion} allows a higher minimum than ${theirVersion}`}
+        return {winner: "ours", reason: `our range ${ours} allows a higher minimum than ${theirs}`}
       } else if (rangeComparison < 0) {
-        return {
-          resolved: theirVersion,
-          reason: `their range ${theirVersion} allows a higher minimum than ${ourVersion}`,
-        }
+        return {winner: "theirs", reason: `their range ${theirs} allows a higher minimum than ${ours}`}
       }
       // Ranges have equal minimums, prefer the one with more specific range
-      return this.preferMoreSpecific(ourVersion, theirVersion)
+      return this.preferMoreSpecific(ours, theirs)
     }
 
-    // 3. Coerced comparison for near-semver strings ("v1.2", "1.2.3.4", ...)
-    const ourSemver = coerce(ourClean)
-    const theirSemver = coerce(theirClean)
-
-    if (ourSemver && theirSemver) {
-      const comparison = compare(ourSemver, theirSemver)
-      if (comparison > 0) {
-        return {resolved: ourVersion, reason: `our version ${ourClean} is higher than ${theirClean}`}
-      } else if (comparison < 0) {
-        return {resolved: theirVersion, reason: `their version ${theirClean} is higher than ${ourClean}`}
-      } else {
-        // Semver versions are equal, prefer the one with more specific range
-        return this.preferMoreSpecific(ourVersion, theirVersion)
-      }
-    }
-
-    // 4. Non-comparable specs (git URLs, file:, workspace:, dist-tags, ...):
-    // keep our version deterministically instead of guessing.
-    return {
-      resolved: ourVersion,
-      reason: `versions are not comparable ("${ourVersion}" vs "${theirVersion}"), keeping our version`,
-    }
+    // 3. No version semver can read (a dist-tag, "1.2.3.4", an unsatisfiable range): no order
+    return null
   }
 
   /**
-   * Resolve to lowest version
+   * Order two specs for the lowest strategy, or null when semver cannot.
    */
-  private static resolveLowest(ourVersion: string, theirVersion: string): {resolved: string; reason: string} {
-    const ourClean = this.cleanVersion(ourVersion)
-    const theirClean = this.cleanVersion(theirVersion)
-
-    // Only identical raw specs short-circuit: "^1.2.3" and "~1.2.3" share a
-    // base version but are different ranges and must go through resolution
-    if (ourVersion.trim() === theirVersion.trim()) {
-      return {resolved: ourVersion, reason: "versions are identical"}
-    }
+  private static orderLowest(ours: string, theirs: string): Order | null {
+    const ourClean = this.cleanVersion(ours)
+    const theirClean = this.cleanVersion(theirs)
 
     // 1. Direct semver comparison, only when both specs are exact versions —
     // comparing cleaned ranges here would erase range semantics ("^" vs "~")
-    if (valid(ourVersion.trim()) && valid(theirVersion.trim())) {
+    if (valid(ours.trim()) && valid(theirs.trim())) {
       const comparison = compare(ourClean, theirClean)
       if (comparison < 0) {
-        return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}
+        return {winner: "ours", reason: `our version ${ourClean} is lower than ${theirClean}`}
       } else if (comparison > 0) {
-        return {resolved: theirVersion, reason: `their version ${theirClean} is lower than ${ourClean}`}
-      } else {
-        return {resolved: ourVersion, reason: "versions are identical"}
+        return {winner: "theirs", reason: `their version ${theirClean} is lower than ${ourClean}`}
       }
+      return {winner: "ours", reason: "versions are identical"}
     }
 
     // 2. Compare as semver ranges
-    const minimums = this.rangeMinimums(ourVersion, theirVersion)
+    const minimums = this.rangeMinimums(ours, theirs)
     if (minimums !== null) {
       const rangeComparison = compare(minimums.ours, minimums.theirs)
       if (rangeComparison < 0) {
-        return {resolved: ourVersion, reason: `our range ${ourVersion} allows a lower minimum than ${theirVersion}`}
+        return {winner: "ours", reason: `our range ${ours} allows a lower minimum than ${theirs}`}
       } else if (rangeComparison > 0) {
-        return {resolved: theirVersion, reason: `their range ${theirVersion} allows a lower minimum than ${ourVersion}`}
+        return {winner: "theirs", reason: `their range ${theirs} allows a lower minimum than ${ours}`}
       }
       // Ranges have equal minimums, prefer the one with more restrictive range
-      return this.preferMoreRestrictive(ourVersion, theirVersion)
+      return this.preferMoreRestrictive(ours, theirs)
     }
 
-    // 3. Coerced comparison for near-semver strings
-    const ourSemver = coerce(ourClean)
-    const theirSemver = coerce(theirClean)
-
-    if (ourSemver && theirSemver) {
-      const comparison = compare(ourSemver, theirSemver)
-      if (comparison < 0) {
-        return {resolved: ourVersion, reason: `our version ${ourClean} is lower than ${theirClean}`}
-      } else if (comparison > 0) {
-        return {resolved: theirVersion, reason: `their version ${theirClean} is lower than ${ourClean}`}
-      } else {
-        // Semver versions are equal, prefer the one with more restrictive range
-        return this.preferMoreRestrictive(ourVersion, theirVersion)
-      }
-    }
-
-    // 4. Non-comparable specs: keep our version deterministically.
-    return {
-      resolved: ourVersion,
-      reason: `versions are not comparable ("${ourVersion}" vs "${theirVersion}"), keeping our version`,
-    }
+    // 3. No version semver can read: no order
+    return null
   }
 
   /**
@@ -188,7 +248,7 @@ export class VersionResolver {
 
   /**
    * Minimum satisfying versions of two specs interpreted as semver ranges.
-   * Returns null when either side is not a valid range.
+   * Returns null when either side is not a valid range, or one no version satisfies.
    */
   private static rangeMinimums(ourVersion: string, theirVersion: string): {ours: SemVer; theirs: SemVer} | null {
     try {
@@ -223,33 +283,31 @@ export class VersionResolver {
   /**
    * Prefer more specific version range
    */
-  private static preferMoreSpecific(ourVersion: string, theirVersion: string): {resolved: string; reason: string} {
-    const ourSpecificity = this.getVersionSpecificity(ourVersion)
-    const theirSpecificity = this.getVersionSpecificity(theirVersion)
+  private static preferMoreSpecific(ours: string, theirs: string): Order {
+    const ourSpecificity = this.getVersionSpecificity(ours)
+    const theirSpecificity = this.getVersionSpecificity(theirs)
 
     if (ourSpecificity > theirSpecificity) {
-      return {resolved: ourVersion, reason: "our version is more specific"}
+      return {winner: "ours", reason: "our version is more specific"}
     } else if (theirSpecificity > ourSpecificity) {
-      return {resolved: theirVersion, reason: "their version is more specific"}
-    } else {
-      return {resolved: ourVersion, reason: "versions have equal specificity, keeping ours"}
+      return {winner: "theirs", reason: "their version is more specific"}
     }
+    return {winner: "ours", reason: "versions have equal specificity, keeping ours"}
   }
 
   /**
    * Prefer more restrictive version range
    */
-  private static preferMoreRestrictive(ourVersion: string, theirVersion: string): {resolved: string; reason: string} {
-    const ourRestrictiveness = this.getVersionRestrictiveness(ourVersion)
-    const theirRestrictiveness = this.getVersionRestrictiveness(theirVersion)
+  private static preferMoreRestrictive(ours: string, theirs: string): Order {
+    const ourRestrictiveness = this.getVersionRestrictiveness(ours)
+    const theirRestrictiveness = this.getVersionRestrictiveness(theirs)
 
     if (ourRestrictiveness > theirRestrictiveness) {
-      return {resolved: ourVersion, reason: "our version is more restrictive"}
+      return {winner: "ours", reason: "our version is more restrictive"}
     } else if (theirRestrictiveness > ourRestrictiveness) {
-      return {resolved: theirVersion, reason: "their version is more restrictive"}
-    } else {
-      return {resolved: ourVersion, reason: "versions have equal restrictiveness, keeping ours"}
+      return {winner: "theirs", reason: "their version is more restrictive"}
     }
+    return {winner: "ours", reason: "versions have equal restrictiveness, keeping ours"}
   }
 
   /**

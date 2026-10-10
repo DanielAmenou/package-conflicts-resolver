@@ -5,9 +5,9 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 ## Features
 
 - **Automatic conflict resolution** with configurable strategies
-- **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`)
-- **No guessing on text** - a script, the description or any other value that is not a version, changed differently on both branches, is left for you between conflict markers around just that property, while everything else is merged (see [Values that are not versions](#values-that-are-not-versions))
-- **Smart version resolution** using semver (ranges, pre-releases, and non-registry specs like `workspace:`, `file:`, and git URLs are handled safely)
+- **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`). Lists such as `files` and `keywords` merge item by item: what either branch added is kept, and what either branch removed stays removed. A dependency one branch removed stays removed too, even if the other branch upgraded it
+- **No guessing** - a value the strategy has no order for is left for you between conflict markers around just that property, while everything else is merged: a script both branches changed, a script one branch removed while the other changed it, or two specs that cannot be compared, such as a git URL and a range (see [Values left for you to decide](#values-left-for-you-to-decide))
+- **Smart version resolution** using semver: ranges and pre-releases are ordered correctly, and `npm:` aliases, `workspace:` ranges and git tags are compared by their versions, never by digits that happen to be in a URL, a file name or a commit hash
 - **List conflicted packages** - `--list` shows every package whose version conflicts, with our, their (and the base) version and what the resolution would keep, as a table or JSON (see [Listing conflicted packages](#listing-conflicted-packages))
 - **Pick versions per package** - `--pick lodash@4.17.21` resolves the packages you choose to the versions you choose, checked against the registry first, while the strategy resolves everything else (see [Choosing versions for specific packages](#choosing-versions-for-specific-packages))
 - **Git integration** as merge driver or in hooks
@@ -91,13 +91,29 @@ Regeneration only runs for lockfiles that already exist in your project, never i
 
 Strategies only decide **real conflicts**: fields that both branches changed to different values. When the common ancestor is known (merge driver, or `diff3`/`zdiff3` conflict markers), a field changed on one branch only is taken from that branch regardless of the strategy — exactly like Git itself. With default-style conflict markers (no ancestor) every differing field is treated as a conflict.
 
+Lists of plain values, such as `files`, `keywords`, `os` or `workspaces`, merge item by item against the common ancestor: an item either branch added is kept, and an item either branch removed stays removed. Without the ancestor, the two lists are combined. Lists of objects are decided as a whole.
+
+A dependency one branch removed stays removed, even when the other branch changed its version: a new version says which version to use, not that the package is still needed. The merge goes on, and lists the changes it dropped:
+
+```
+package-conflicts-resolver: dependencies.lodash: our branch removed it, their change to ^4.17.21 was dropped
+```
+
+To keep such a dependency, [pick its version](#choosing-versions-for-specific-packages), use the strategy of the branch that changed it (`--strategy ours` or `--strategy theirs`), or add it back afterwards. A lockfile follows package.json: its root entry drops the dependency, and the installed entry stays until npm regenerates the lockfile, which prunes it unless another package needs it.
+
 With `highest`, a stable release beats a pre-release even when the pre-release has a higher base version (`2.68.6` wins over `2.68.4-beta.3`, `^1.9.0` wins over `^2.0.0-beta.1`). Two pre-releases, or two stable versions, compare by semver precedence. The same rule applies to package.json ranges and to the exact versions in package-lock.json, so both files always land on the same side.
 
 To decide some packages yourself instead, [pick their versions](#choosing-versions-for-specific-packages).
 
-#### Values that are not versions
+#### Values left for you to decide
 
-`highest` and `lowest` compare versions. A value that is not one, such as a script, the description, `main`, a boolean or an object, has no higher or lower side. When both branches changed it to different values, it is left for you to decide: everything else is merged, and package.json keeps Git conflict markers around just that property.
+`highest` and `lowest` order versions. Some conflicts have no higher or lower side:
+
+- **Values that are not versions**, such as a script, the description, `main`, a boolean or an object, changed differently on both branches.
+- **Versions that cannot be compared**: specs that point at different things, or at something without a version, such as a git URL and a range, two `file:` tarballs, two commits of a repository, or dist-tags. Specs of the same kind are still compared by their versions: two `npm:` aliases of the same package, two `workspace:` ranges, two tags of the same git repository (`#v1.2.0`, `#semver:^1.2.0`), two `packageManager` versions of the same package manager.
+- **A value one branch removed while the other changed it**, such as a script or a config block. Whether it should still be there is a decision, not a comparison. A dependency is the exception: [it stays removed](#resolution-strategies).
+
+They are left for you to decide: everything else is merged, and package.json keeps Git conflict markers around just those properties.
 
 ```
   "scripts": {
@@ -110,11 +126,25 @@ To decide some packages yourself instead, [pick their versions](#choosing-versio
   },
 ```
 
-The command lists these values and exits with code 1. Finish by editing them, or run again with `--strategy ours` or `--strategy theirs`, which decide them like any other conflict. Lockfiles are regenerated once package.json has no conflict markers left, since a package manager cannot read it before that.
+When the common ancestor is known (always in the merge driver, and with `diff3`/`zdiff3` conflict markers), the conflicts also show its value, in a `|||||||` section that is empty when it did not have the value. The side of a branch that removed the value has no line, and the property comes first in its object, so that keeping either side as it is gives valid JSON:
+
+```
+  "scripts": {
+<<<<<<< ours
+||||||| base
+    "lint": "eslint .",
+=======
+    "lint": "eslint --fix .",
+>>>>>>> theirs
+    "build": "tsc"
+  },
+```
+
+The command lists these values with the reason for each, and exits with code 1. Finish by editing them, by picking versions for the dependencies among them with [`--pick`](#choosing-versions-for-specific-packages), or by running again with `--strategy ours` or `--strategy theirs`, which decide them like any other conflict, removals included. Lockfiles are regenerated once package.json has no conflict markers left, since a package manager cannot read it before that.
 
 The merge driver does the same and exits 1, so Git stops before committing the merge: `git status` shows package.json as conflicted, with only those properties between markers.
 
-A lockfile never leaves values for you: it follows package.json, so it keeps ours, and npm rewrites it when the lockfile is regenerated.
+A lockfile never leaves values for you: it follows package.json, so it keeps ours (or, for an installed entry one branch removed, the changed one), and npm rewrites it when the lockfile is regenerated.
 
 ### Listing conflicted packages
 
@@ -149,9 +179,9 @@ Choose the version of a package with --pick <name>@<version>, for example --pick
 
 - **Where** is the dependency field of a declared range (`dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`; in a lockfile, `root › dependencies` is the project's own entry and `packages/web › dependencies` a workspace's), or the install location of a locked version (`node_modules/lodash`, `node_modules/debug/node_modules/ms`).
 - A **Base** column shows the common ancestor's version when the conflict markers carry it (`diff3`/`zdiff3` conflict style). Then a package only one branch changed is no conflict: it merges to that branch's version and is not listed.
-- **Resolved** follows `--strategy`, and previews `--pick` (marked `(picked)`).
-- **Left for you to decide** lists the values both branches changed that are not versions, which a run leaves between conflict markers (see [Values that are not versions](#values-that-are-not-versions)).
-- With `--json`, the report is printed as a single JSON document: `{"strategy", "files": [{"file", "analyzed", "packages": [{"name", "kind", "location", "path", "ours", "theirs", "base"?, "resolved", "resolvedBy", "pick"?}], "otherConflicts": [{"field", "ours", "theirs", "resolved"}], "unresolved": [{"field", "ours", "theirs", "base"?}]}]}`. `kind` is `"spec"` for a declared range and `"lock"` for a locked version.
+- **Resolved** follows `--strategy`, and previews `--pick` (marked `(picked)`). A package the strategy cannot decide reads `(left for you)` (see [Values left for you to decide](#values-left-for-you-to-decide)), and a version a branch removed reads `(removed)`.
+- **Left for you to decide** lists the other values a run leaves between conflict markers, such as scripts.
+- With `--json`, the report is printed as a single JSON document: `{"strategy", "files": [{"file", "analyzed", "packages": [{"name", "kind", "location", "path", "ours", "theirs", "base"?, "resolved", "resolvedBy", "pick"?}], "otherConflicts": [{"field", "ours", "theirs", "resolved"}], "unresolved": [{"field", "path", "reason", "ours", "theirs", "base"?}]}]}`. `kind` is `"spec"` for a declared range and `"lock"` for a locked version. `ours` and `theirs` are `null` for a branch that removed the value, and `resolved` is `null` when the resolution removes the value or leaves it for you. `resolvedBy` is then `"removal"` for a dependency that stays removed, and `"user"` for a value left for you. `unresolved` lists every value left for you, packages included, with a `reason` of `"not-a-version"`, `"not-comparable"` or `"removed"`.
 
 Like a normal run, `--list` looks at the conflicted lockfiles next to a package.json. Conflicted `yarn.lock`, `pnpm-lock.yaml` and `bun.lock` files are mentioned but not analyzed, since their package manager resolves them. The command exits with code 1 only when a conflicted npm file cannot be analyzed, or when a `--pick` is invalid.
 
@@ -391,8 +421,9 @@ if (result.resolved && result.packageJson) {
   await resolver.writeResolvedPackage(result.packageJson, "package.json", conflictedContent, result.unresolved)
 }
 
-// `result.unresolved` lists the values both branches changed that are not versions
-// (with highest and lowest): field, path, ours, theirs, and base when it is known.
+// `result.unresolved` lists the values highest and lowest cannot decide: field, path,
+// reason ("not-a-version", "not-comparable" or "removed"), ours, theirs (undefined for
+// a branch that removed the value), and base when it is known.
 // `result.packageJson` holds our value in their place until you decide.
 
 // For lockfiles, `result.lockfileIssues` lists dependency edges the merged
@@ -414,7 +445,10 @@ Conflicts on package versions are reported in a structured form, and versions ca
 
 ```typescript
 // Every conflicting spec or locked version: name, kind ("spec" | "lock"), location, path,
-// ours, theirs, base (when known), resolved, resolvedBy (the strategy, or "pick")
+// ours, theirs, base (when known), resolved, resolvedBy (the strategy, "pick", "removal" for
+// a dependency that stays removed, or "user" for a value left for you). ours and theirs are
+// null for a branch that removed the value; resolved is null when the value is removed or
+// left for you.
 for (const conflict of result.packageConflicts ?? []) {
   console.log(`${conflict.name} (${conflict.location}): ${conflict.ours} vs ${conflict.theirs} -> ${conflict.resolved}`)
 }
@@ -506,9 +540,13 @@ package-conflicts-resolver verify
 
 - The two branches' lockfiles cannot be combined into a graph that satisfies every dependency (the message lists the ones that fail). Run `npm install --package-lock-only`, then `git add package-lock.json` and finish the merge. See [Lockfile consistency](#lockfile-consistency).
 
-**"both branches changed ... not a version" during `git merge`**
+**"left ... between conflict markers for you to decide" during `git merge`**
 
-- Both branches changed a script, the description or another value that is not a version, so the merge driver left it for you between conflict markers; everything else is merged. Edit package.json, or run `package-conflicts-resolver --strategy ours` (or `theirs`), then `git add package.json` and finish the merge. See [Values that are not versions](#values-that-are-not-versions).
+- The merge driver found values the strategy has no order for, such as a script both branches changed or removed on one branch, or two specs that cannot be compared, and left them for you between conflict markers; everything else is merged. Edit package.json, or run `package-conflicts-resolver` with `--pick <package>@<version>` or `--strategy ours` (or `theirs`), then `git add package.json` and finish the merge. See [Values left for you to decide](#values-left-for-you-to-decide).
+
+**"our branch removed it, their change to ... was dropped" during `git merge`**
+
+- One branch removed a dependency that the other branch upgraded, so it stays removed and the merge finished without it. If the code still needs it, add it back with `npm install <name>@<version>`. See [Resolution Strategies](#resolution-strategies).
 
 **.gitattributes not working**
 

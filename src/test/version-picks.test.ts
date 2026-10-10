@@ -347,6 +347,26 @@ describe("findPickProblems", () => {
   })
 })
 
+describe("findPickProblems with removed entries", () => {
+  test("an entry a branch removed reads as removed", () => {
+    const conflicts: FilePackageConflict[] = [
+      {
+        name: "lodash",
+        kind: "lock",
+        location: "node_modules/lodash",
+        path: ["packages", "node_modules/lodash"],
+        ours: null,
+        theirs: "4.17.21",
+        resolved: "4.17.21",
+        resolvedBy: "theirs",
+        pick: "4.17.22",
+      },
+    ]
+    const [problem] = findPickProblems({lodash: "4.17.22"}, conflicts)
+    assert.match(problem?.message ?? "", /\(node_modules\/lodash: ours removed, theirs 4\.17\.21\)/)
+  })
+})
+
 describe("verifyVersionPicks", () => {
   const REGISTRY: Record<string, PackageVersions> = {
     lodash: {versions: ["4.17.19", "4.17.20", "4.17.21"], distTags: {latest: "4.17.21"}},

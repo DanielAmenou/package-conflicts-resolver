@@ -125,9 +125,10 @@ describe("VersionResolver edge cases", () => {
     assert.equal(result.resolved, "file:../local-pkg")
   })
 
-  test("handles npm: alias specs without throwing", () => {
+  test("compares npm: aliases of the same package by their versions", () => {
     const result = VersionResolver.resolveVersion("npm:foo@^1.0.0", "npm:foo@^2.0.0", "highest")
-    assert.ok(result.resolved)
+    assert.equal(result.resolved, "npm:foo@^2.0.0")
+    assert.equal(result.comparable, true)
   })
 
   test("identical non-semver specs resolve as identical", () => {

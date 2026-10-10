@@ -38,14 +38,24 @@ describe("Three-way merge semantics", () => {
     assert.deepEqual(result.packageJson!.dependencies, {express: "^4.18.0"})
   })
 
-  test("modification wins over deletion", async () => {
+  test("a dependency deleted on one side stays deleted, even though the other side upgraded it", async () => {
     const base = j({dependencies: {lodash: "^1.0.0"}})
     const ours = j({dependencies: {}}) // we deleted lodash
     const theirs = j({dependencies: {lodash: "^2.0.0"}}) // they upgraded it
 
     const result = await makeResolver().mergeJsonContents(base, ours, theirs)
     assert.equal(result.resolved, true)
-    assert.deepEqual(result.packageJson!.dependencies, {lodash: "^2.0.0"})
+    assert.deepEqual(result.packageJson!.dependencies, {})
+    assert.deepEqual(result.unresolved, [])
+    assert.deepEqual(
+      result.packageConflicts?.map(conflict => [conflict.name, conflict.resolvedBy]),
+      [["lodash", "removal"]]
+    )
+
+    const withOurs = await makeResolver("ours").mergeJsonContents(base, ours, theirs)
+    assert.deepEqual(withOurs.packageJson!.dependencies, {})
+    const withTheirs = await makeResolver("theirs").mergeJsonContents(base, ours, theirs)
+    assert.deepEqual(withTheirs.packageJson!.dependencies, {lodash: "^2.0.0"})
   })
 
   test("dependency added on both sides with different ranges uses the strategy", async () => {

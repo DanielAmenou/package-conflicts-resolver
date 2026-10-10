@@ -50,7 +50,13 @@ describe("overrides and resolutions", () => {
 
     const result = await makeResolver("highest").mergeJsonContents("", ours, theirs)
     assert.deepEqual(result.unresolved, [
-      {field: "scripts.overrides", path: ["scripts", "overrides"], ours: "node apply-a.js", theirs: "node apply-b.js"},
+      {
+        field: "scripts.overrides",
+        path: ["scripts", "overrides"],
+        reason: "not-a-version",
+        ours: "node apply-a.js",
+        theirs: "node apply-b.js",
+      },
     ])
   })
 

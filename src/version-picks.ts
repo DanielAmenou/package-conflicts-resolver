@@ -291,7 +291,7 @@ export function findPickProblems(
       const sides = own
         .map(conflict => {
           const where = conflict.file !== undefined ? `${conflict.file} ${conflict.location}` : conflict.location
-          return `${where}: ours ${conflict.ours}, theirs ${conflict.theirs}`
+          return `${where}: ours ${conflict.ours ?? "removed"}, theirs ${conflict.theirs ?? "removed"}`
         })
         .join("; ")
       problems.push({

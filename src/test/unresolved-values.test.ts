@@ -52,24 +52,32 @@ const THEIRS = {
   dependencies: {lodash: "^4.17.20", react: "^18.0.0"},
 }
 
-/** What a run leaves in package.json for the three-way merge above, with highest */
+/**
+ * What a run leaves in package.json for the three-way merge above, with
+ * highest: every conflict shows the common ancestor, which did not have private
+ */
 const WRITTEN = [
   "{",
   '  "name": "app",',
   '  "version": "1.2.0",',
   "<<<<<<< ours",
   '  "description": "ours",',
+  "||||||| base",
+  '  "description": "old",',
   "=======",
   '  "description": "theirs",',
   ">>>>>>> theirs",
   "<<<<<<< ours",
   '  "private": true,',
+  "||||||| base",
   "=======",
   '  "private": false,',
   ">>>>>>> theirs",
   '  "scripts": {',
   "<<<<<<< ours",
   '    "build": "tsc -b",',
+  "||||||| base",
+  '    "build": "tsc",',
   "=======",
   '    "build": "tsc && vite build",',
   ">>>>>>> theirs",
@@ -109,9 +117,23 @@ describe("values that are not versions, in package.json", () => {
       assert.equal(result.resolved, true, result.errors.join(", "))
 
       assert.deepEqual(result.unresolved, [
-        {field: "description", path: ["description"], ours: "ours", theirs: "theirs", base: "old"},
-        {field: "private", path: ["private"], ours: true, theirs: false},
-        {field: "scripts.build", path: ["scripts", "build"], ours: "tsc -b", theirs: "tsc && vite build", base: "tsc"},
+        {
+          field: "description",
+          path: ["description"],
+          reason: "not-a-version",
+          ours: "ours",
+          theirs: "theirs",
+          base: "old",
+        },
+        {field: "private", path: ["private"], reason: "not-a-version", ours: true, theirs: false},
+        {
+          field: "scripts.build",
+          path: ["scripts", "build"],
+          reason: "not-a-version",
+          ours: "tsc -b",
+          theirs: "tsc && vite build",
+          base: "tsc",
+        },
       ])
       // Only the version was decided by the strategy; our values hold the places left open
       assert.deepEqual(
@@ -260,6 +282,8 @@ describe("writing values left for the user", () => {
         '\t"scripts": {',
         "<<<<<<< ours",
         '\t\t"say \\"hi\\"": "echo a",',
+        "||||||| base",
+        '\t\t"say \\"hi\\"": "echo",',
         "=======",
         '\t\t"say \\"hi\\"": "echo b",',
         ">>>>>>> theirs",
@@ -348,6 +372,28 @@ describe("values that are not versions in the block-based fallback", () => {
     ])
   })
 
+  test("several values are named together", async () => {
+    const several = [
+      "{",
+      '  "scripts": {',
+      "<<<<<<< HEAD",
+      '    "build": "tsc -b", // strict',
+      '    "test": "jest"',
+      "=======",
+      '    "build": "tsc && vite build",',
+      '    "test": "vitest"',
+      ">>>>>>> feature",
+      "  }",
+      "}",
+    ].join("\n")
+
+    const result = await resolver("lowest").resolveConflicts(several)
+    assert.equal(result.resolved, false)
+    assert.deepEqual(result.errors, [
+      "scripts.build, scripts.test changed on both branches and are not versions, which the lowest strategy cannot decide: resolve them by hand, or with the ours or theirs strategy",
+    ])
+  })
+
   test("a block without a version to go by is not decided either", async () => {
     const block = [
       "{",
@@ -395,9 +441,16 @@ describe("the CLI with values left for the user", () => {
 
       const result = await runCli(["--no-regenerate-lock"], dir)
       assert.equal(result.code, 1, result.stderr)
-      assert.match(result.stderr, /Both branches changed a value that is not a version: scripts\.build/)
-      assert.match(result.stderr, /Left it between conflict markers in package\.json for you to decide/)
-      assert.match(result.stderr, /Edit it, or run again with --strategy ours or --strategy theirs\./)
+      assert(
+        result.stderr.includes(
+          [
+            "⚠️  Left a value between conflict markers in package.json for you to decide:",
+            "   - scripts.build: both branches changed it, and it is not a version",
+            "   Everything else is merged. Edit it, or run again with --strategy ours or --strategy theirs.",
+          ].join("\n")
+        ),
+        result.stderr
+      )
 
       const written = await readFile(file, "utf8")
       assert(written.includes(BUILD_CONFLICT), written)
@@ -422,7 +475,15 @@ describe("the CLI with values left for the user", () => {
       assert.equal(result.code, 1)
       const warning = jsonLines(result.stdout).find(record => record.level === "warn")
       assert.deepEqual(warning.data, {
-        unresolved: [{field: "scripts.build", ours: "tsc -b", theirs: "tsc && vite build"}],
+        unresolved: [
+          {
+            field: "scripts.build",
+            path: ["scripts", "build"],
+            reason: "not-a-version",
+            ours: "tsc -b",
+            theirs: "tsc && vite build",
+          },
+        ],
       })
     })
   })
@@ -435,13 +496,13 @@ describe("the CLI with values left for the user", () => {
 
       const dryRun = await runCli(["--dry-run"], dir)
       assert.equal(dryRun.code, 1)
-      assert.match(dryRun.stderr, /Would leave it between conflict markers in package\.json/)
+      assert.match(dryRun.stderr, /Would leave a value between conflict markers in package\.json/)
       assert.equal(await readFile(file, "utf8"), content)
 
       const quiet = await runCli(["--quiet", "--no-regenerate-lock"], dir)
       assert.equal(quiet.code, 1)
       assert.equal(quiet.stdout, "")
-      assert.match(quiet.stderr, /Both branches changed a value that is not a version: scripts\.build/)
+      assert.match(quiet.stderr, /scripts\.build: both branches changed it, and it is not a version/)
     })
   })
 
@@ -456,7 +517,13 @@ describe("the CLI with values left for the user", () => {
       const json = await runCli(["--list", "--json"], dir)
       const [report] = jsonLines(json.stdout)
       assert.deepEqual(report.files[0].unresolved, [
-        {field: "scripts.build", ours: "tsc -b", theirs: "tsc && vite build"},
+        {
+          field: "scripts.build",
+          path: ["scripts", "build"],
+          reason: "not-a-version",
+          ours: "tsc -b",
+          theirs: "tsc && vite build",
+        },
       ])
     })
   })
@@ -474,12 +541,27 @@ describe("the CLI with values left for the user", () => {
 
       const result = await runCli(["merge-driver", current, base, other], dir)
       assert.equal(result.code, 1)
-      assert.match(
-        result.stderr,
-        /^package-conflicts-resolver: both branches changed a value that is not a version: scripts\.build$/m
-      )
+      assert.deepEqual(result.stderr.trim().split("\n"), [
+        "package-conflicts-resolver: left a value between conflict markers for you to decide:",
+        "  - scripts.build: both branches changed it, and it is not a version",
+        "package-conflicts-resolver: everything else is merged. Edit it, or run package-conflicts-resolver --strategy ours (or theirs) on the file.",
+      ])
+      // The driver knows the common ancestor, and shows it
       const written = await readFile(current, "utf8")
-      assert(written.includes(BUILD_CONFLICT), written)
+      assert(
+        written.includes(
+          [
+            "<<<<<<< ours",
+            '    "build": "tsc -b",',
+            "||||||| base",
+            '    "build": "tsc",',
+            "=======",
+            '    "build": "tsc && vite build",',
+            ">>>>>>> theirs",
+          ].join("\n")
+        ),
+        written
+      )
       assert(written.includes('"lodash": "^4.17.21"'))
     })
   })
@@ -524,7 +606,7 @@ describe("a real git merge with values left for the user", () => {
       const merge = await git(["merge", "feature"], dir)
       assert.equal(merge.code, 1, `${merge.stdout}\n${merge.stderr}`)
       assert.match(`${merge.stdout}\n${merge.stderr}`, /CONFLICT \(content\): Merge conflict in package\.json/)
-      assert.match(merge.stderr, /both branches changed a value that is not a version: scripts\.build/)
+      assert.match(merge.stderr, /scripts\.build: both branches changed it, and it is not a version/)
       assert.equal((await git(["status", "--porcelain"], dir)).stdout.trim(), "UU package.json")
 
       const written = await readFile(join(dir, "package.json"), "utf8")

@@ -6,6 +6,7 @@
 export {PackageResolver} from "./package-resolver.js"
 export {ConflictParser} from "./conflict-parser.js"
 export {VersionResolver} from "./version-resolver.js"
+export type {VersionResolution} from "./version-resolver.js"
 export {Logger} from "./logger.js"
 export {LOCKFILES, findLockfiles, detectPackageManager} from "./package-manager.js"
 export type {PackageManagerName, LockfileInfo} from "./package-manager.js"
