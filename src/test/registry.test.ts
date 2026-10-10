@@ -37,6 +37,23 @@ describe("parseNpmViewOutput", () => {
     })
   })
 
+  test("npm 12 prints an array, with an entry for each manifest it read", () => {
+    // As npm 12.2.0 prints it
+    const stdout =
+      '[\n  {\n    "versions": [\n      "4.17.20",\n      "4.17.21"\n    ],\n    "dist-tags": {\n      "latest": "4.17.21"\n    }\n  }\n]\n'
+    assert.deepEqual(parseNpmViewOutput(ok(stdout)), {versions: ["4.17.20", "4.17.21"], distTags: {latest: "4.17.21"}})
+
+    const twoEntries = JSON.stringify([
+      {versions: ["1.0.0", "2.0.0-rc.1"], "dist-tags": {latest: "1.0.0"}},
+      {versions: ["1.0.0", "2.0.0-rc.1", "2.0.0"], "dist-tags": {latest: "2.0.0", next: "2.0.0-rc.1"}},
+    ])
+    assert.deepEqual(parseNpmViewOutput(ok(twoEntries)), {
+      versions: ["1.0.0", "2.0.0-rc.1", "2.0.0"],
+      distTags: {latest: "1.0.0", next: "2.0.0-rc.1"},
+    })
+    assert.deepEqual(parseNpmViewOutput(ok("[]")), {versions: [], distTags: {}})
+  })
+
   test("no output means no published versions", () => {
     assert.deepEqual(parseNpmViewOutput(ok("")), {versions: [], distTags: {}})
     assert.deepEqual(parseNpmViewOutput(ok("\n  \n")), {versions: [], distTags: {}})
@@ -46,6 +63,7 @@ describe("parseNpmViewOutput", () => {
     assert.throws(() => parseNpmViewOutput(ok("npm WARN something")), /npm view printed something that is not JSON/)
     assert.throws(() => parseNpmViewOutput(ok('["1.0.0"]')), /npm view printed an unexpected result/)
     assert.throws(() => parseNpmViewOutput(ok("null")), /npm view printed an unexpected result/)
+    assert.throws(() => parseNpmViewOutput(ok('[{"versions": []}, 3]')), /npm view printed an unexpected result/)
   })
 
   test("E404 means the registry does not have the package, wherever npm prints it", () => {

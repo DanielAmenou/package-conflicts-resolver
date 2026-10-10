@@ -24,6 +24,23 @@ jobs:
       - run: npm run build
       - run: npm test
 
+  # Tests that run the real npm use the version bundled with Node above. This job tries the latest npm, which the
+  # Release workflow publishes with, so that a new npm major breaks CI before it breaks a release.
+  latest-npm:
+    name: Latest npm on ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm install -g npm@latest
+      - run: npm --version
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
   format:
     name: Prettier check
     runs-on: ubuntu-latest

@@ -66,6 +66,9 @@ export function createNpmVersionLookup(options: NpmVersionLookupOptions): Packag
  * Interpret the output of `npm view <name> versions dist-tags --json`: the
  * versions on success, null when the registry does not have the package
  * (E404), an Error with npm's own explanation for anything else.
+ *
+ * npm 12 prints an array, with an entry for each manifest it read; earlier
+ * versions print a single object. Both are read the same way.
  */
 export function parseNpmViewOutput(output: CommandOutput): PackageVersions | null {
   if (output.code !== 0) {
@@ -86,24 +89,30 @@ export function parseNpmViewOutput(output: CommandOutput): PackageVersions | nul
   } catch {
     throw new Error("npm view printed something that is not JSON")
   }
-  if (!isPlainObject(document)) {
+  const entries = Array.isArray(document) ? document : [document]
+  if (!entries.every(isPlainObject)) {
     throw new Error("npm view printed an unexpected result")
   }
 
-  const versions = document.versions
-  const distTags = document["dist-tags"]
-  return {
-    versions: Array.isArray(versions)
-      ? versions.filter((version): version is string => typeof version === "string")
-      : typeof versions === "string"
-        ? [versions]
-        : [],
-    distTags: isPlainObject(distTags)
-      ? Object.fromEntries(
-          Object.entries(distTags).filter((entry): entry is [string, string] => typeof entry[1] === "string")
-        )
-      : {},
+  // The fields asked for belong to the package, not to one of its versions:
+  // every entry should have the same, but nothing is lost should they differ
+  const versions = new Set<string>()
+  const distTags = new Map<string, string>()
+  for (const entry of entries) {
+    const listed = typeof entry.versions === "string" ? [entry.versions] : entry.versions
+    for (const version of Array.isArray(listed) ? listed : []) {
+      if (typeof version === "string") {
+        versions.add(version)
+      }
+    }
+    const tags = entry["dist-tags"]
+    for (const [tag, version] of isPlainObject(tags) ? Object.entries(tags) : []) {
+      if (typeof version === "string" && !distTags.has(tag)) {
+        distTags.set(tag, version)
+      }
+    }
   }
+  return {versions: [...versions], distTags: Object.fromEntries(distTags)}
 }
 
 /**
