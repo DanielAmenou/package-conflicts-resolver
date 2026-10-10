@@ -7,6 +7,8 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 - **Automatic conflict resolution** with configurable strategies
 - **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`)
 - **Smart version resolution** using semver (ranges, pre-releases, and non-registry specs like `workspace:`, `file:`, and git URLs are handled safely)
+- **List conflicted packages** - `--list` shows every package whose version conflicts, with our, their (and the base) version and what the resolution would keep, as a table or JSON (see [Listing conflicted packages](#listing-conflicted-packages))
+- **Pick versions per package** - `--pick lodash@4.17.21` resolves the packages you choose to the versions you choose, checked against the registry first, while the strategy resolves everything else (see [Choosing versions for specific packages](#choosing-versions-for-specific-packages))
 - **Git integration** as merge driver or in hooks
 - **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers (diff3 base sections enable true 3-way merges)
 - **Lockfile-safe merging** - a package-lock entry is resolved as a whole: `version`, `resolved`, and `integrity` are never mixed between branches
@@ -58,6 +60,12 @@ npx package-conflicts-resolver --dry-run
 
 # Use different resolution strategy
 npx package-conflicts-resolver --strategy lowest
+
+# List the conflicted packages with our and their versions (changes nothing)
+npx package-conflicts-resolver --list
+
+# Choose the version of some packages; the strategy resolves the rest
+npx package-conflicts-resolver --pick lodash@4.17.21 --pick typescript@~5.5.4
 ```
 
 When the target is a `package.json`, conflicted sibling lockfiles are detected and handled in the same run — even if `package.json` itself merged cleanly:
@@ -83,6 +91,76 @@ Regeneration only runs for lockfiles that already exist in your project, never i
 Strategies only decide **real conflicts**: fields that both branches changed to different values. When the common ancestor is known (merge driver, or `diff3`/`zdiff3` conflict markers), a field changed on one branch only is taken from that branch regardless of the strategy — exactly like Git itself. With default-style conflict markers (no ancestor) every differing field is treated as a conflict.
 
 With `highest`, a stable release beats a pre-release even when the pre-release has a higher base version (`2.68.6` wins over `2.68.4-beta.3`, `^1.9.0` wins over `^2.0.0-beta.1`). Two pre-releases, or two stable versions, compare by semver precedence. The same rule applies to package.json ranges and to the exact versions in package-lock.json, so both files always land on the same side.
+
+To decide some packages yourself instead, [pick their versions](#choosing-versions-for-specific-packages).
+
+### Listing conflicted packages
+
+See which packages conflict, what each branch wants, and what the resolution would keep, without changing any file:
+
+```bash
+npx package-conflicts-resolver --list
+```
+
+```
+📋 package.json: 3 conflicted packages (strategy: highest)
+
+   Package     Where            Ours      Theirs    Resolved
+   lodash      dependencies     ^4.17.19  ^4.17.21  ^4.17.21
+   react       dependencies     ^18.2.0   ^18.3.1   ^18.3.1
+   typescript  devDependencies  ~5.4.5    ~5.6.2    ~5.6.2
+
+   Also conflicted: version (ours 1.1.0, theirs 1.2.0 → 1.2.0)
+
+📋 package-lock.json: 3 conflicted packages (strategy: highest)
+
+   Package     Where                    Ours      Theirs    Resolved
+   lodash      root › dependencies      ^4.17.19  ^4.17.21  ^4.17.21
+   lodash      node_modules/lodash      4.17.19   4.17.21   4.17.21
+   react       root › dependencies      ^18.2.0   ^18.3.1   ^18.3.1
+   react       node_modules/react       18.2.0    18.3.1    18.3.1
+   typescript  root › devDependencies   ~5.4.5    ~5.6.2    ~5.6.2
+   typescript  node_modules/typescript  5.4.5     5.6.2     5.6.2
+
+Choose the version of a package with --pick <name>@<version>, for example --pick lodash@^4.17.21
+```
+
+- **Where** is the dependency field of a declared range (`dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`; in a lockfile, `root › dependencies` is the project's own entry and `packages/web › dependencies` a workspace's), or the install location of a locked version (`node_modules/lodash`, `node_modules/debug/node_modules/ms`).
+- A **Base** column shows the common ancestor's version when the conflict markers carry it (`diff3`/`zdiff3` conflict style). Then a package only one branch changed is no conflict: it merges to that branch's version and is not listed.
+- **Resolved** follows `--strategy`, and previews `--pick` (marked `(picked)`).
+- With `--json`, the report is printed as a single JSON document: `{"strategy", "files": [{"file", "analyzed", "packages": [{"name", "kind", "location", "path", "ours", "theirs", "base"?, "resolved", "resolvedBy", "pick"?}], "otherConflicts": [{"field", "ours", "theirs", "resolved"}]}]}`. `kind` is `"spec"` for a declared range and `"lock"` for a locked version.
+
+Like a normal run, `--list` looks at the conflicted lockfiles next to a package.json. Conflicted `yarn.lock`, `pnpm-lock.yaml` and `bun.lock` files are mentioned but not analyzed, since their package manager resolves them. The command exits with code 1 only when a conflicted npm file cannot be analyzed, or when a `--pick` is invalid.
+
+### Choosing versions for specific packages
+
+Decide the version of any conflicted package yourself, with one `--pick` per package. Every other conflict is still resolved by the strategy:
+
+```bash
+npx package-conflicts-resolver --pick typescript@~5.5.4 --pick react@18.3.1
+npx package-conflicts-resolver --strategy lowest --pick lodash@^4.17.21
+```
+
+- **package.json** gets the picked spec exactly as you wrote it: `--pick lodash@4.17.21` pins `4.17.21`, `--pick lodash@^4.17.21` keeps a caret range. A lockfile's copy of the specs (its root and workspace entries) gets the same value.
+- **package-lock.json** keeps, for every conflicted install of the package, the branch's entry whose locked version satisfies the pick, with its `version`, `resolved` and `integrity` together. When neither branch locked a matching version (you picked a third version), npm locks it when the lockfile is regenerated, which is the default. With `--no-regenerate-lock` the lockfile is reported as inconsistent until you run `npm install --package-lock-only`.
+
+Nothing is written unless every pick passes these checks:
+
+1. It reads `<name>@<version>`, with an exact version or a semver range. `npm:` aliases (`my-lodash@npm:lodash@^4.17.0`), `file:` paths, git and tarball URLs work too. Dist-tags such as `latest` do not: they say nothing about which version gets installed.
+2. The package is conflicted. A typo gets a suggestion (`lodsh is not conflicted (did you mean lodash?)`). A package that is only conflicted in package-lock.json entries can only be picked at a version one of the branches locked, since a lockfile entry for another version can only come from npm.
+3. The version exists. It is looked up with `npm view <name> versions` in your project, so your `.npmrc` settings (registry, scoped registries, credentials, proxy) apply. `file:` paths are checked on disk, while git, URL and `workspace:` specs cannot be checked and are used as given, with a warning. `--no-version-check` skips the lookup, for example when working offline.
+
+`--pick` combines with `--dry-run` (check and preview), `--list`, `--json` and `--quiet`.
+
+#### With the merge driver installed
+
+The merge driver resolves package.json and package-lock.json during `git merge` itself, so no conflict markers are left to list or to pick from. To decide versions yourself in one merge, let Git do its own line merge for that merge only (`--diff3` adds the common ancestor to the markers):
+
+```bash
+git -c merge.package-conflicts-resolver.driver="git merge-file --diff3 -L HEAD -L base -L incoming %A %O %B" merge feature
+npx package-conflicts-resolver --list
+npx package-conflicts-resolver --pick lodash@4.17.21
+```
 
 ### Lockfile consistency
 
@@ -128,6 +206,9 @@ npx package-conflicts-resolver verify           # Verify Git integration is work
 -j, --json                    Output in JSON format
 -v, --verbose                 Enable verbose logging
 --no-regenerate-lock          Skip package-lock.json regeneration
+-l, --list                    List conflicted packages with our and their versions, without changing anything
+-p, --pick <name@version>     Resolve a conflicted package to this version instead of using the strategy (repeatable)
+--no-version-check            Do not check that picked versions exist in the registry
 --skip-gitattributes          Skip automatic .gitattributes setup (for setup command)
 --allow-inconsistent-lockfile Accept an inconsistent merged lockfile (for merge-driver command)
 ```
@@ -299,6 +380,30 @@ if (lockResult.lockfileIssues?.length) {
 // The check is also available on its own
 import {validateLockfile} from "package-conflicts-resolver"
 const issues = validateLockfile(JSON.parse(lockfileText), JSON.parse(packageJsonText))
+```
+
+Conflicts on package versions are reported in a structured form, and versions can be picked per package:
+
+```typescript
+// Every conflicting spec or locked version: name, kind ("spec" | "lock"), location, path,
+// ours, theirs, base (when known), resolved, resolvedBy (the strategy, or "pick")
+for (const conflict of result.packageConflicts ?? []) {
+  console.log(`${conflict.name} (${conflict.location}): ${conflict.ours} vs ${conflict.theirs} -> ${conflict.resolved}`)
+}
+
+// Pick versions for some packages; the strategy resolves every other conflict
+const picks = {lodash: "4.17.21", typescript: "~5.5.4"}
+const picker = new PackageResolver({...options, picks})
+const picked = await picker.resolveConflicts(conflictedContent)
+
+// Check picks like the CLI does before writing anything
+import {findPickProblems, verifyVersionPicks, createNpmVersionLookup} from "package-conflicts-resolver"
+const problems = findPickProblems(picks, picked.packageConflicts ?? []) // not conflicted, or cannot apply
+const checks = await verifyVersionPicks(picks, {
+  lookup: createNpmVersionLookup({cwd: projectDir}), // or your own (name) => {versions, distTags} | null
+  cwd: projectDir,
+})
+const missing = checks.filter(check => check.status === "error")
 ```
 
 ## Troubleshooting

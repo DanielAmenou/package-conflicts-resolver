@@ -14,6 +14,16 @@ import {PackageResolver} from "./package-resolver.js"
 import {Logger} from "./logger.js"
 import {LOCKFILES, PackageManagerName, findLockfiles, resolveSafeRegenCommand} from "./package-manager.js"
 import {formatLockfileIssues, isNpmLockfile, validateLockfile} from "./lockfile-validator.js"
+import {spawnCommand} from "./process.js"
+import {createNpmVersionLookup} from "./registry.js"
+import {findPickProblems, parseVersionPicks, verifyVersionPicks} from "./version-picks.js"
+import {
+  ConflictReport,
+  ConflictReportFile,
+  formatConflictReport,
+  reportFile,
+  unanalyzedFile,
+} from "./conflict-report.js"
 import {RESOLUTION_STRATEGIES, CliOptions, LockfileIssue, PackageJson, ResolutionResult} from "./types.js"
 
 const IS_WINDOWS = process.platform === "win32"
@@ -42,12 +52,10 @@ function getToolVersion(): string {
 }
 
 /**
- * Spawn a command cross-platform. On Windows, package manager CLIs are .cmd
- * shims and require a shell to execute (plain spawn fails with EINVAL on Node 20+).
+ * Collect the values of a repeatable option
  */
-function spawnCommand(command: string, args: string[], options: Parameters<typeof spawn>[2] = {}) {
-  const needsShell = IS_WINDOWS && ["npm", "npx", "yarn", "pnpm", "bun"].includes(command)
-  return spawn(command, args, {...options, shell: needsShell})
+function collect(value: string, previous: string[] = []): string[] {
+  return [...previous, value]
 }
 
 /**
@@ -89,6 +97,13 @@ async function main() {
     .option("-j, --json", "Output in JSON format", false)
     .option("-v, --verbose", "Enable verbose logging", false)
     .option("--no-regenerate-lock", "Skip package-lock.json regeneration")
+    .option("-l, --list", "List the conflicted packages with our and their versions, without changing anything", false)
+    .option(
+      "-p, --pick <name@version>",
+      "Resolve a conflicted package to this version instead of using the strategy (repeatable)",
+      collect
+    )
+    .option("--no-version-check", "Do not check that picked versions exist in the registry")
     .action(async (file: string, options: any) => {
       const cliOptions: CliOptions = {
         strategy: options.strategy,
@@ -98,6 +113,8 @@ async function main() {
         verbose: options.verbose,
         regenerateLock: options.regenerateLock,
         file,
+        list: options.list,
+        versionCheck: options.versionCheck,
       }
 
       // Validate strategy
@@ -105,6 +122,18 @@ async function main() {
         console.error(`❌ Invalid strategy: ${cliOptions.strategy}`)
         console.error(`Available strategies: ${Object.keys(RESOLUTION_STRATEGIES).join(", ")}`)
         process.exit(1)
+      }
+
+      // Validate picked versions (their existence is checked once the conflicts are known)
+      const {picks, errors} = parseVersionPicks(options.pick ?? [])
+      if (errors.length > 0) {
+        for (const error of errors) {
+          console.error(`❌ Invalid --pick: ${error}`)
+        }
+        process.exit(1)
+      }
+      if (Object.keys(picks).length > 0) {
+        cliOptions.picks = picks
       }
 
       try {
@@ -259,6 +288,12 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
 
   // Read file content
   const content = await readFile(filePath, "utf8")
+
+  // --list and --pick look at every conflict before anything is written
+  if (options.list || options.picks !== undefined) {
+    await checkBeforeResolving(filePath, content, options)
+  }
+
   const targetHasConflicts = ConflictParser.hasConflicts(content)
   const targetIsPackageJson = basename(resolve(filePath)) === "package.json"
   const dir = dirname(resolve(filePath))
@@ -374,6 +409,168 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
 
   const exitWithError = failed.length > 0 || (inconsistent.length > 0 && !options.dryRun)
   process.exit(exitWithError ? 1 : 0)
+}
+
+/**
+ * Run before resolving when packages are listed or versions picked: resolve
+ * every conflicted file in memory to learn which packages conflict, then
+ * either print them (--list, which ends the command) or validate the picks.
+ * Invalid picks end the command before any file is written.
+ */
+async function checkBeforeResolving(filePath: string, content: string, options: CliOptions): Promise<void> {
+  const dir = dirname(resolve(filePath))
+  const {files, failed} = await analyzeConflicts(filePath, content, options)
+  const check = options.picks !== undefined ? await checkPicks(options.picks, files, options, dir) : undefined
+
+  if (options.list) {
+    const report: ConflictReport = {strategy: options.strategy, files}
+    if (options.json) {
+      console.log(JSON.stringify(report))
+    } else {
+      for (const line of formatConflictReport(report)) {
+        console.log(line)
+      }
+    }
+    for (const warning of check?.warnings ?? []) {
+      console.warn(`⚠️  ${warning}`)
+    }
+    for (const error of check?.errors ?? []) {
+      console.error(`❌ ${error}`)
+    }
+    process.exit(failed || (check?.errors.length ?? 0) > 0 ? 1 : 0)
+  }
+
+  // A target that cannot be resolved fails exactly like it does without picks
+  const target = files.find(file => file.file === filePath)
+  if (target !== undefined && !target.analyzed) {
+    console.error(`❌ Failed to resolve conflicts: ${target.reason}`)
+    process.exit(1)
+  }
+
+  const logger = new Logger({quiet: options.quiet, json: options.json, verbose: options.verbose})
+  // check is always set here: without --list this only runs for --pick
+  const {errors, warnings, verified} = check as PickCheck
+  for (const warning of warnings) {
+    logger.warn(warning)
+  }
+  if (errors.length > 0) {
+    for (const error of errors) {
+      console.error(`❌ ${error}`)
+    }
+    console.error("   No file was changed.")
+    process.exit(1)
+  }
+
+  for (const message of verified) {
+    logger.success(message)
+  }
+  if (options.versionCheck === false) {
+    logger.info("Picked versions were not checked against the registry (--no-version-check)")
+  }
+
+  // A picked version that neither branch locked gets locked by npm, from the picked spec
+  if (options.regenerateLock && !options.dryRun) {
+    const conflicts = files.flatMap(file => file.packages.map(conflict => ({...conflict, file: file.file})))
+    const pickedSpecs = new Set(conflicts.filter(c => c.kind === "spec" && c.resolvedBy === "pick").map(c => c.name))
+    for (const conflict of conflicts) {
+      const topLevel = conflict.location === `node_modules/${conflict.name}`
+      if (topLevel && conflict.resolvedBy !== "pick" && pickedSpecs.has(conflict.name)) {
+        logger.info(
+          `${conflict.name}@${conflict.pick} is not locked on either branch of ${conflict.file}; npm locks it when regenerating the lockfile`
+        )
+      }
+    }
+  }
+}
+
+/**
+ * Resolve, in memory only, every conflicted file the command works on: the
+ * target, plus the conflicted lockfiles next to a package.json target.
+ * Nothing is written or printed. `failed` tells whether a file this tool
+ * merges could not be resolved.
+ */
+async function analyzeConflicts(
+  filePath: string,
+  content: string,
+  options: CliOptions
+): Promise<{files: ConflictReportFile[]; failed: boolean}> {
+  const files: ConflictReportFile[] = []
+  let failed = false
+  const analyze = async (file: string, text: string) => {
+    const result = await new PackageResolver({...options, silent: true}).resolveConflicts(text)
+    failed = failed || !result.resolved
+    files.push(reportFile(file, result))
+  }
+
+  if (ConflictParser.hasConflicts(content)) {
+    await analyze(filePath, content)
+  }
+
+  if (basename(resolve(filePath)) === "package.json") {
+    const dir = dirname(resolve(filePath))
+    for (const lockfile of LOCKFILES) {
+      let lockContent: string
+      try {
+        lockContent = await readFile(join(dir, lockfile.name), "utf8")
+      } catch {
+        continue // Lockfile doesn't exist
+      }
+      if (!ConflictParser.hasConflicts(lockContent)) {
+        continue
+      }
+      if (lockfile.jsonMergeable) {
+        await analyze(lockfile.name, lockContent)
+      } else {
+        const reason = `${lockfile.packageManager} resolves it when you run "${lockfile.manualCommand}"`
+        files.push(unanalyzedFile(lockfile.name, reason))
+      }
+    }
+  }
+
+  return {files, failed}
+}
+
+interface PickCheck {
+  errors: string[]
+  /** Picks that could not be checked and are used as given */
+  warnings: string[]
+  /** Picks found in the registry */
+  verified: string[]
+}
+
+/**
+ * Check every pick: its package must be conflicted and the pick must apply
+ * to at least one of the conflicts, and its version must exist (unless
+ * --no-version-check). Versions are only looked up for picks that apply.
+ */
+async function checkPicks(
+  picks: Record<string, string>,
+  files: ConflictReportFile[],
+  options: CliOptions,
+  dir: string
+): Promise<PickCheck> {
+  const conflicts = files.flatMap(file => file.packages.map(conflict => ({...conflict, file: file.file})))
+  const problems = findPickProblems(picks, conflicts)
+  const check: PickCheck = {errors: problems.map(problem => problem.message), warnings: [], verified: []}
+
+  const applicable = Object.fromEntries(
+    Object.entries(picks).filter(([name]) => !problems.some(problem => problem.name === name))
+  )
+  if (options.versionCheck === false || Object.keys(applicable).length === 0) {
+    return check
+  }
+
+  const lookup = createNpmVersionLookup({cwd: dir})
+  for (const verification of await verifyVersionPicks(applicable, {lookup, cwd: dir})) {
+    if (verification.status === "error") {
+      check.errors.push(verification.message)
+    } else if (verification.status === "unverified") {
+      check.warnings.push(verification.message)
+    } else {
+      check.verified.push(verification.message)
+    }
+  }
+  return check
 }
 
 interface FailedLockfile {

@@ -245,3 +245,26 @@ describe("Logger attached data", () => {
     assert.equal(parsed.data.conflicts[0].resolvedValue, "")
   })
 })
+
+describe("Logger silent mode", () => {
+  test("prints nothing at all, warnings and errors included, in every mode", () => {
+    for (const options of [HUMAN, JSON_MODE, VERBOSE]) {
+      const logger = new Logger({...options, silent: true})
+      const out = capture(() => {
+        logger.info("info", {a: 1})
+        logger.success("success", {a: 1})
+        logger.warn("warn", {a: 1})
+        logger.error("error", {a: 1})
+        logger.debug("debug", {a: 1})
+        logger.logConflicts([CONFLICT])
+        logger.summary(1, 1, false)
+      })
+      assert.deepEqual(out, {logs: [], warns: [], errors: []}, JSON.stringify(options))
+    }
+  })
+
+  test("silent: false behaves like before", () => {
+    const out = capture(() => new Logger({...HUMAN, silent: false}).error("still printed"))
+    assert.deepEqual(out.errors, ["❌ still printed"])
+  })
+})

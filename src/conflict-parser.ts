@@ -6,6 +6,16 @@ import {ConflictMarker} from "./types.js"
 
 export type ConflictSide = "ours" | "theirs" | "base"
 
+/** What a line of a conflicted document is */
+type LineRole = "context" | "marker" | ConflictSide
+
+/** A bracket of a JSON line, with the key it is the value of when it opens an object or array under a key */
+interface BracketToken {
+  open: boolean
+  bracket: string
+  key?: string
+}
+
 export class ConflictParser {
   // Labels after the markers are optional and CRLF line endings are tolerated.
   private static readonly CONFLICT_START = /^<{7}(?:\s.*)?$/
@@ -179,6 +189,135 @@ export class ConflictParser {
     }
 
     return result.join("\n")
+  }
+
+  /**
+   * The JSON path of the object a line sits in, read from the text above it:
+   * ["packages", "node_modules/lodash"] for a line inside that lockfile entry,
+   * ["devDependencies"] inside that field, [] at the top level. Conflicts above
+   * the line count with their "ours" side only, which is what the document
+   * looks like on the current branch. Undefined when the structure cannot be
+   * followed: the line is inside an array, or the text above is not the
+   * beginning of a JSON object.
+   */
+  static enclosingPath(content: string, lineIndex: number): string[] | undefined {
+    const lines = content.split("\n")
+    const roles = this.lineRoles(lines)
+    // Brackets still open at the line, innermost first
+    const open: BracketToken[] = []
+    let unmatchedClosers = 0
+
+    for (let i = Math.min(lineIndex, lines.length) - 1; i >= 0; i--) {
+      if (roles[i] !== "context" && roles[i] !== "ours") {
+        continue
+      }
+      const tokens = this.bracketTokens(lines[i] as string)
+      for (let t = tokens.length - 1; t >= 0; t--) {
+        const token = tokens[t] as BracketToken
+        if (!token.open) {
+          unmatchedClosers++
+        } else if (unmatchedClosers > 0) {
+          unmatchedClosers--
+        } else {
+          open.push(token)
+        }
+      }
+    }
+
+    // The outermost bracket must be the document's own "{", every other one an object under a key
+    const root = open.pop()
+    if (root === undefined || root.bracket !== "{" || root.key !== undefined) {
+      return undefined
+    }
+    if (open.some(token => token.bracket !== "{" || token.key === undefined)) {
+      return undefined
+    }
+    return open.reverse().map(token => token.key as string)
+  }
+
+  /**
+   * Classify every line of a conflicted document, following the same rules as
+   * parseConflicts: lines of an unterminated conflict count as context.
+   */
+  private static lineRoles(lines: string[]): LineRole[] {
+    const roles: LineRole[] = lines.map(() => "context")
+    // Roles of the conflict being read, applied once its end marker is found
+    let pending: Array<[number, LineRole]> = []
+    let section: ConflictSide | undefined
+
+    for (let i = 0; i < lines.length; i++) {
+      const marker = this.markerText(lines[i] as string)
+
+      if (this.CONFLICT_START.test(marker)) {
+        pending = [[i, "marker"]]
+        section = "ours"
+      } else if (section === undefined) {
+        continue
+      } else if (this.CONFLICT_BASE.test(marker) && section !== "theirs") {
+        pending.push([i, "marker"])
+        section = "base"
+      } else if (this.CONFLICT_MIDDLE.test(marker)) {
+        pending.push([i, "marker"])
+        section = "theirs"
+      } else if (this.CONFLICT_END.test(marker) && section === "theirs") {
+        pending.push([i, "marker"])
+        for (const [index, role] of pending) {
+          roles[index] = role
+        }
+        pending = []
+        section = undefined
+      } else {
+        pending.push([i, section])
+      }
+    }
+
+    return roles
+  }
+
+  /**
+   * The brackets of one JSON line, outside string literals. An opening bracket
+   * that directly follows `"key":` carries that key.
+   */
+  private static bracketTokens(line: string): BracketToken[] {
+    const tokens: BracketToken[] = []
+    let lastString: string | undefined
+    let key: string | undefined
+
+    for (let i = 0; i < line.length; i++) {
+      const char = line[i] as string
+
+      if (char === '"') {
+        let end = i + 1
+        while (end < line.length && line[end] !== '"') {
+          end += line[end] === "\\" ? 2 : 1
+        }
+        const raw = line.slice(i + 1, end)
+        try {
+          lastString = JSON.parse(`"${raw}"`)
+        } catch {
+          lastString = raw
+        }
+        key = undefined
+        i = end
+      } else if (char === ":") {
+        key = lastString
+        lastString = undefined
+      } else if (char === "{" || char === "[") {
+        tokens.push(key !== undefined ? {open: true, bracket: char, key} : {open: true, bracket: char})
+        key = undefined
+        lastString = undefined
+      } else if (char === "}" || char === "]") {
+        tokens.push({open: false, bracket: char})
+        key = undefined
+        lastString = undefined
+      } else if (!/\s/.test(char)) {
+        // a comma, or a literal value: neither can carry a key to a bracket
+        key = undefined
+        lastString = undefined
+      }
+    }
+
+    return tokens
   }
 
   /**

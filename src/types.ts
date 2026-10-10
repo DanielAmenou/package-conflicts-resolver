@@ -46,6 +46,43 @@ export interface ResolvedConflict {
    * must be inserted as-is instead of being re-formatted as a JSON property.
    */
   verbatim?: boolean
+  /** Name of the package whose version this conflict is about, when it is about one */
+  package?: string
+}
+
+/**
+ * A package whose version both branches changed, to different values.
+ */
+export interface PackageConflict {
+  /** Package name, e.g. "lodash" or "@types/node" */
+  name: string
+  /**
+   * - "spec": a dependency range the project declares (package.json, or the
+   *   root and workspace entries of a lockfile)
+   * - "lock": an installed package of an npm lockfile, locked to an exact version
+   */
+  kind: "spec" | "lock"
+  /**
+   * Where the conflict is: the dependency field of a package.json spec
+   * ("devDependencies"), the entry and field of a lockfile spec
+   * ("root › dependencies", "packages/app › dependencies"), or the install
+   * location of a locked package ("node_modules/lodash")
+   */
+  location: string
+  /** JSON path of the conflicting value inside the document */
+  path: string[]
+  /** Our spec or locked version */
+  ours: string
+  /** Their spec or locked version */
+  theirs: string
+  /** The common ancestor's value, when it is known (merge driver, diff3/zdiff3 markers) */
+  base?: string
+  /** The value the resolution kept */
+  resolved: string
+  /** What chose `resolved`: the strategy's name, or "pick" for a version the user picked */
+  resolvedBy: string
+  /** The version picked for this package, when there is one — even if it could not be applied here */
+  pick?: string
 }
 
 /**
@@ -79,12 +116,21 @@ export interface ResolutionResult {
    * `npm install --package-lock-only` before `npm ci` will accept it.
    */
   lockfileIssues?: LockfileIssue[]
+  /**
+   * Conflicts on package versions, one per conflicting value: the dependency
+   * specs of package.json (and of a lockfile's root and workspace entries) and
+   * the installed packages of an npm lockfile. Set whenever conflicts were
+   * resolved; also lists the values `picks` decided.
+   */
+  packageConflicts?: PackageConflict[]
 }
 
 export interface LoggerOptions {
   quiet: boolean
   json: boolean
   verbose: boolean
+  /** Print nothing at all, warnings and errors included */
+  silent?: boolean
 }
 
 export interface CliOptions {
@@ -100,6 +146,18 @@ export interface CliOptions {
    * graph is inconsistent instead of leaving the file conflicted for npm.
    */
   allowInconsistentLockfile?: boolean
+  /**
+   * Versions picked for specific packages (package name -> version or range).
+   * A picked package's conflicts are resolved to that version instead of by
+   * the strategy; every other conflict still uses the strategy.
+   */
+  picks?: Record<string, string>
+  /** CLI: list the conflicted packages instead of resolving them */
+  list?: boolean
+  /** CLI: check that picked versions exist in the registry (default true) */
+  versionCheck?: boolean
+  /** Print nothing at all, warnings and errors included (for analysis passes) */
+  silent?: boolean
 }
 
 export const RESOLUTION_STRATEGIES: Record<ResolutionStrategy["name"], ResolutionStrategy> = {

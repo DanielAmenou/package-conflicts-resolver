@@ -8,11 +8,130 @@ import {VersionResolver} from "./version-resolver.js"
 import {Logger} from "./logger.js"
 import {parseJsonLenient} from "./json-repair.js"
 import {isNpmLockfile, validateLockfile} from "./lockfile-validator.js"
-import {PackageJson, ConflictMarker, ResolutionResult, ResolvedConflict, CliOptions, LockfileIssue} from "./types.js"
+import {lockedVersionSatisfies, normalizeVersionPicks} from "./version-picks.js"
+import {
+  PackageJson,
+  ConflictMarker,
+  ResolutionResult,
+  ResolvedConflict,
+  CliOptions,
+  LockfileIssue,
+  PackageConflict,
+} from "./types.js"
 
 interface MergeOutcome {
   value: any
   conflicts: ResolvedConflict[]
+  /** Conflicts on package versions found while merging this value */
+  packageConflicts?: PackageConflict[]
+}
+
+/**
+ * What decides which values of the merged documents are package versions.
+ */
+interface MergeContext {
+  /** The documents are npm lockfiles rather than package.json manifests */
+  lockfile: boolean
+  /**
+   * The lockfile has a v2/v3 "packages" section. The legacy "dependencies"
+   * section of a v2 lockfile then repeats the same installs: conflicts there
+   * are resolved the same way but not listed a second time.
+   */
+  packagesSection: boolean
+}
+
+/** A value that belongs to a package: a spec it is declared with, or a locked install of it */
+interface PackageRef {
+  name: string
+  kind: PackageConflict["kind"]
+  location: string
+  /** Whether conflicts on this value are reported in packageConflicts */
+  listed: boolean
+}
+
+/** A locked package entry a block-based (fallback) conflict covers, as each side has it */
+interface FragmentEntry {
+  ref: PackageRef
+  path: string[]
+  ours: Record<string, any>
+  theirs: Record<string, any>
+}
+
+/** Fields that map package names to the version specs the project depends on */
+const DEPENDENCY_FIELDS = new Set(["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"])
+
+const NODE_MODULES = "node_modules/"
+
+/**
+ * Whether a lockfile "packages" key is an install location
+ * ("node_modules/a/node_modules/b"), rather than the root project ("") or a
+ * workspace folder ("packages/app").
+ */
+function isInstallLocation(location: string): boolean {
+  return location.startsWith(NODE_MODULES) || location.includes(`/${NODE_MODULES}`)
+}
+
+/**
+ * The package a value belongs to, from its path in the document:
+ * - package.json: <dependency field>.<name>
+ * - lockfile root and workspace entries: packages.<"" | folder>.<dependency field>.<name>
+ * - lockfile installs: packages.<...node_modules/name> (lockfile v2/v3), and
+ *   dependencies.<name>[.dependencies.<name>...] (lockfile v1, and the legacy
+ *   section of v2)
+ * The dependency fields inside installed entries are the published manifests
+ * of third-party packages, not choices of the project: they are not packages'
+ * specs here.
+ */
+function packageAt(path: string[], context: MergeContext): PackageRef | undefined {
+  const [first, second, third, fourth] = path
+
+  if (!context.lockfile) {
+    return path.length === 2 && DEPENDENCY_FIELDS.has(first as string)
+      ? {name: second as string, kind: "spec", location: first as string, listed: true}
+      : undefined
+  }
+
+  if (first === "packages" && second !== undefined) {
+    if (path.length === 2 && isInstallLocation(second)) {
+      const name = second.slice(second.lastIndexOf(NODE_MODULES) + NODE_MODULES.length)
+      return name === "" ? undefined : {name, kind: "lock", location: second, listed: true}
+    }
+    if (path.length === 4 && !isInstallLocation(second) && DEPENDENCY_FIELDS.has(third as string)) {
+      const location = `${second === "" ? "root" : second} › ${third}`
+      return {name: fourth as string, kind: "spec", location, listed: true}
+    }
+    return undefined
+  }
+
+  const isLegacyInstall =
+    path.length >= 2 &&
+    path.length % 2 === 0 &&
+    path.every((segment, index) => index % 2 === 1 || segment === "dependencies")
+  if (isLegacyInstall) {
+    const names = path.filter((_, index) => index % 2 === 1)
+    return {
+      name: names[names.length - 1] as string,
+      kind: "lock",
+      location: names.map(name => `${NODE_MODULES}${name}`).join("/"),
+      listed: !context.packagesSection,
+    }
+  }
+
+  return undefined
+}
+
+/**
+ * How a locked entry is shown in a package conflict: its version, or what it
+ * points at when it has none (workspace links, some git and file installs).
+ */
+function describeLockEntry(entry: Record<string, any>): string {
+  if (typeof entry.version === "string") {
+    return entry.version
+  }
+  if (typeof entry.resolved === "string") {
+    return entry.resolved
+  }
+  return "(no version)"
 }
 
 /**
@@ -50,13 +169,17 @@ const LOCK_ENTRY_IDENTITY_FIELDS = ["version", "resolved", "integrity"] as const
 export class PackageResolver {
   private logger: Logger
   private options: CliOptions
+  /** Versions picked for specific packages: they win over the strategy */
+  private picks: Map<string, string>
 
   constructor(options: CliOptions) {
     this.options = options
+    this.picks = normalizeVersionPicks(options.picks)
     this.logger = new Logger({
       quiet: options.quiet,
       json: options.json,
       verbose: options.verbose,
+      silent: options.silent,
     })
   }
 
@@ -77,6 +200,7 @@ export class PackageResolver {
       // Check if there are any conflicts
       if (!ConflictParser.hasConflicts(content)) {
         this.logger.info("No conflicts found")
+        result.packageConflicts = []
         result.resolved = true
         return result
       }
@@ -87,6 +211,7 @@ export class PackageResolver {
       if (semanticResult) {
         result.conflicts = semanticResult.conflicts
         result.packageJson = semanticResult.packageJson
+        result.packageConflicts = semanticResult.packageConflicts ?? []
         if (semanticResult.lockfileIssues !== undefined) {
           result.lockfileIssues = semanticResult.lockfileIssues
         }
@@ -103,10 +228,12 @@ export class PackageResolver {
 
       // Resolve each conflict
       const resolvedSections = new Map<number, string>()
+      const context = this.fallbackContext(content)
+      const packageConflicts: PackageConflict[] = []
 
       for (const conflict of conflicts) {
         try {
-          const resolved = await this.resolveConflict(conflict, content)
+          const resolved = await this.resolveConflict(conflict, content, context, packageConflicts)
           if (resolved) {
             result.conflicts.push(resolved)
             resolvedSections.set(conflict.start, this.formatResolvedContent(resolved))
@@ -125,6 +252,7 @@ export class PackageResolver {
         try {
           const parsedJson = this.parseResolvedJson(resolvedContent)
           result.packageJson = parsedJson
+          result.packageConflicts = packageConflicts
           this.attachLockfileIssues(result, this.parseConflictSides(content))
           result.resolved = true
 
@@ -220,6 +348,7 @@ export class PackageResolver {
           throw new Error("Expected JSON object documents")
         }
         result.packageJson = survivor as PackageJson
+        result.packageConflicts = []
         result.resolved = true
         return result
       }
@@ -235,8 +364,13 @@ export class PackageResolver {
         throw new Error("Expected base document to be a JSON object")
       }
 
-      const merged = this.mergeValue([], baseDocument, ourDocument, theirDocument)
+      const context: MergeContext = {
+        lockfile: isNpmLockfile(ourDocument) || isNpmLockfile(theirDocument),
+        packagesSection: this.isPlainObject(ourDocument.packages) || this.isPlainObject(theirDocument.packages),
+      }
+      const merged = this.mergeValue([], baseDocument, ourDocument, theirDocument, context)
       result.conflicts = merged.conflicts
+      result.packageConflicts = merged.packageConflicts ?? []
       result.packageJson = this.finalizeMergedDocument(merged.value)
       this.attachLockfileIssues(result, [ourDocument, theirDocument])
       result.resolved = true
@@ -292,9 +426,25 @@ export class PackageResolver {
   }
 
   /**
+   * The merge context of a document whose sides could not be parsed, read
+   * from its text since there is no parsed document to inspect.
+   */
+  private fallbackContext(content: string): MergeContext {
+    return {
+      lockfile: /"lockfileVersion"\s*:/.test(content),
+      packagesSection: /"packages"\s*:\s*\{/.test(content),
+    }
+  }
+
+  /**
    * Resolve a single conflict
    */
-  private async resolveConflict(conflict: ConflictMarker, fullContent: string): Promise<ResolvedConflict | null> {
+  private async resolveConflict(
+    conflict: ConflictMarker,
+    fullContent: string,
+    context: MergeContext,
+    packageConflicts: PackageConflict[]
+  ): Promise<ResolvedConflict | null> {
     try {
       // Find the field being conflicted first
       const fieldName =
@@ -308,7 +458,15 @@ export class PackageResolver {
       if (this.isDependencyField(fieldName) || fieldName === "scripts") {
         const ourData = ConflictParser.parsePartialJson(conflict.ours)
         const theirData = ConflictParser.parsePartialJson(conflict.theirs)
-        const resolved = this.resolveDependencyConflict(fieldName, ourData, theirData)
+        const container = this.fallbackContainer(fieldName, ourData, theirData, fullContent, conflict.start)
+        const resolved = this.resolveDependencyConflict(
+          fieldName,
+          ourData,
+          theirData,
+          container,
+          context,
+          packageConflicts
+        )
 
         // Keep the raw conflict content so formatting can tell whether the
         // conflict covered the whole field or only entries inside it
@@ -325,7 +483,8 @@ export class PackageResolver {
       // one) cannot be rebuilt property by property without losing data:
       // keep one side verbatim instead.
       if (fieldName.startsWith("node_modules/") || this.isCompoundFragment(conflict)) {
-        return this.resolveFragmentVerbatim(fieldName, conflict)
+        const enclosing = ConflictParser.enclosingPath(fullContent, conflict.start)
+        return this.resolveFragmentVerbatim(fieldName, conflict, enclosing, context, packageConflicts)
       }
 
       // For simple fields, extract values directly
@@ -358,17 +517,39 @@ export class PackageResolver {
   }
 
   /**
-   * Resolve a multi-property conflict by taking one side as-is. When both
-   * sides carry a version, the strategy picks the winner by version; an empty
-   * side (block deleted or added on one branch only) loses to the side that
-   * still has content; otherwise the strategy picks a side.
+   * Resolve a multi-property conflict by taking one side as-is. A version
+   * picked for the locked package the conflict covers keeps the side that
+   * satisfies it; otherwise, when both sides carry a version, the strategy
+   * picks the winner by version; an empty side (block deleted or added on one
+   * branch only) loses to the side that still has content; otherwise the
+   * strategy picks a side.
    */
-  private resolveFragmentVerbatim(fieldName: string, conflict: ConflictMarker): ResolvedConflict {
+  private resolveFragmentVerbatim(
+    fieldName: string,
+    conflict: ConflictMarker,
+    enclosing: string[] | undefined,
+    context: MergeContext,
+    packageConflicts: PackageConflict[]
+  ): ResolvedConflict {
     const ourVersion = this.fragmentVersion(conflict.ours, fieldName)
     const theirVersion = this.fragmentVersion(conflict.theirs, fieldName)
+    const entry = this.fragmentEntry(conflict, fieldName, enclosing, context)
+    const pick = entry !== undefined ? this.picks.get(entry.ref.name) : undefined
+
+    // The side a picked version selects, when exactly one side satisfies it
+    let pickedTheirs: boolean | undefined
+    if (entry !== undefined && pick !== undefined) {
+      const ourMatches = lockedVersionSatisfies(entry.ours, entry.ref.name, pick)
+      const theirMatches = lockedVersionSatisfies(entry.theirs, entry.ref.name, pick)
+      if (ourMatches !== theirMatches) {
+        pickedTheirs = theirMatches
+      }
+    }
 
     let winnerIsTheirs: boolean
-    if (ourVersion !== undefined && theirVersion !== undefined && ourVersion !== theirVersion) {
+    if (pickedTheirs !== undefined) {
+      winnerIsTheirs = pickedTheirs
+    } else if (ourVersion !== undefined && theirVersion !== undefined && ourVersion !== theirVersion) {
       const resolution = VersionResolver.resolveVersion(ourVersion, theirVersion, this.options.strategy)
       winnerIsTheirs = resolution.resolved === theirVersion
     } else if (conflict.ours.trim() === "" || conflict.theirs.trim() === "") {
@@ -386,16 +567,135 @@ export class PackageResolver {
       winner = `${winner.replace(/\s*$/, "")},`
     }
 
-    return {
+    // As in a semantic merge, the pick decided when the entry kept satisfies it
+    let resolvedBy: string = this.options.strategy
+    if (entry !== undefined) {
+      const kept = winnerIsTheirs ? entry.theirs : entry.ours
+      if (pick !== undefined && lockedVersionSatisfies(kept, entry.ref.name, pick)) {
+        resolvedBy = "pick"
+      }
+      if (entry.ref.listed && !isDeepStrictEqual(entry.ours, entry.theirs)) {
+        packageConflicts.push(
+          this.packageConflict(
+            entry.ref,
+            entry.path,
+            {
+              ours: describeLockEntry(entry.ours),
+              theirs: describeLockEntry(entry.theirs),
+              resolved: describeLockEntry(kept),
+            },
+            resolvedBy,
+            pick
+          )
+        )
+      }
+    }
+
+    const resolved: ResolvedConflict = {
       field: fieldName,
       ourValue: conflict.ours,
       theirValue: conflict.theirs,
       resolvedValue: winner,
-      strategy: this.options.strategy,
+      strategy: resolvedBy,
       verbatim: true,
       originalOurs: conflict.ours,
       originalTheirs: conflict.theirs,
     }
+    if (entry !== undefined) {
+      resolved.package = entry.ref.name
+    }
+    return resolved
+  }
+
+  /**
+   * The locked package entry a block-based conflict is about, when both sides
+   * have one: either the conflict declares the entry (`"node_modules/x": {`
+   * among its lines, as the first entry it holds), or it sits inside the entry
+   * (its lines are the entry's version/resolved/integrity fields). Mirrors how
+   * fragmentVersion() finds the version that decides the conflict.
+   */
+  private fragmentEntry(
+    conflict: ConflictMarker,
+    fieldName: string,
+    enclosing: string[] | undefined,
+    context: MergeContext
+  ): FragmentEntry | undefined {
+    if (enclosing === undefined) {
+      return undefined
+    }
+
+    const ourData = this.parseFragment(conflict.ours)
+    const theirData = this.parseFragment(conflict.theirs)
+    const declaresEntry =
+      isInstallLocation(fieldName) ||
+      [ourData, theirData].some(
+        data => data !== undefined && typeof data.version !== "string" && this.isPlainObject(data[fieldName])
+      )
+
+    const path = declaresEntry ? enclosing.concat(fieldName) : enclosing
+    const ref = packageAt(path, context)
+    if (ref?.kind !== "lock") {
+      return undefined
+    }
+
+    const ours = this.fragmentEntryData(ourData, fieldName)
+    const theirs = this.fragmentEntryData(theirData, fieldName)
+    return ours !== undefined && theirs !== undefined ? {ref, path, ours, theirs} : undefined
+  }
+
+  /** One side of a block-based conflict as an object, when it parses as one (parsePartialJson never throws) */
+  private parseFragment(side: string): Record<string, any> | undefined {
+    const data = side.trim() !== "" ? ConflictParser.parsePartialJson(side) : undefined
+    return this.isPlainObject(data) ? data : undefined
+  }
+
+  /** The entry a parsed fragment holds: the fragment itself, or the entry it declares */
+  private fragmentEntryData(data: Record<string, any> | undefined, fieldName: string): Record<string, any> | undefined {
+    if (data === undefined) {
+      return undefined
+    }
+    if (typeof data.version === "string") {
+      return data
+    }
+    const declared = data[fieldName]
+    return this.isPlainObject(declared) ? declared : undefined
+  }
+
+  /**
+   * The package spec an entry of a block-based dependency conflict is, when
+   * the object holding the entries is known and is a dependency field.
+   */
+  private specAt(
+    container: string[] | undefined,
+    name: string,
+    context: MergeContext
+  ): {ref: PackageRef; path: string[]} | undefined {
+    if (container === undefined) {
+      return undefined
+    }
+    const path = container.concat(name)
+    const ref = packageAt(path, context)
+    return ref?.kind === "spec" ? {ref, path} : undefined
+  }
+
+  /**
+   * Path of the object whose entries a block-based dependency conflict holds:
+   * the field itself when the conflict declares it, otherwise the object the
+   * conflict sits in. Undefined when the surrounding structure is unclear.
+   */
+  private fallbackContainer(
+    fieldName: string,
+    ourData: any,
+    theirData: any,
+    fullContent: string,
+    conflictStart: number
+  ): string[] | undefined {
+    const enclosing = ConflictParser.enclosingPath(fullContent, conflictStart)
+    if (enclosing === undefined) {
+      return undefined
+    }
+    const declared = [ourData, theirData].some(data => this.isPlainObject(data) && this.isPlainObject(data[fieldName]))
+    return declared ? enclosing.concat(fieldName) : enclosing
   }
 
   /**
@@ -429,9 +729,18 @@ export class PackageResolver {
   }
 
   /**
-   * Resolve dependency field conflicts (dependencies, devDependencies, etc.)
+   * Resolve dependency field conflicts (dependencies, devDependencies, etc.).
+   * `container` is the path of the object holding the entries, when known: it
+   * tells which entries are package specs a picked version applies to.
    */
-  private resolveDependencyConflict(fieldName: string, ourData: any, theirData: any): ResolvedConflict | null {
+  private resolveDependencyConflict(
+    fieldName: string,
+    ourData: any,
+    theirData: any,
+    container: string[] | undefined,
+    context: MergeContext,
+    packageConflicts: PackageConflict[]
+  ): ResolvedConflict | null {
     // For dependency conflicts, ourData and theirData should be the parsed dependency objects
     // But they might be individual dependency lines, so we need to handle both cases
 
@@ -459,6 +768,10 @@ export class PackageResolver {
 
     // Merge dependencies, resolving version conflicts while preserving order
     const merged: Record<string, string> = {}
+    // Entries whose values conflicted in this block, the package specs among them, and how many a pick decided
+    let conflicted = 0
+    const specs: string[] = []
+    let picked = 0
 
     // First add all our dependencies in their original order
     for (const packageName of Object.keys(ourDeps)) {
@@ -480,25 +793,49 @@ export class PackageResolver {
         // At this point we know theirVersion is defined (checked above)
         // and ourVersion must be defined since it's in merged
         if (ourVersion !== theirVersion) {
-          // Version conflict - resolve using strategy
-          // We know both versions are defined at this point
-          const resolution = VersionResolver.resolveVersion(
-            ourVersion as string,
-            theirVersion as string,
-            this.options.strategy
-          )
-          merged[packageName] = resolution.resolved
+          // Version conflict: a picked version wins, otherwise the strategy decides
+          const spec = this.specAt(container, packageName, context)
+          const pick = spec !== undefined ? this.picks.get(spec.ref.name) : undefined
+          const resolvedVersion =
+            pick !== undefined
+              ? pick
+              : VersionResolver.resolveVersion(ourVersion as string, theirVersion as string, this.options.strategy)
+                  .resolved
+          merged[packageName] = resolvedVersion
+          conflicted++
+          picked += pick !== undefined ? 1 : 0
+
+          if (spec !== undefined) {
+            specs.push(spec.ref.name)
+            packageConflicts.push(
+              this.packageConflict(
+                spec.ref,
+                spec.path,
+                {
+                  ours: this.stringifyConflictValue(ourVersion),
+                  theirs: this.stringifyConflictValue(theirVersion),
+                  resolved: this.stringifyConflictValue(resolvedVersion),
+                },
+                pick !== undefined ? "pick" : this.options.strategy,
+                pick
+              )
+            )
+          }
         }
       }
     }
 
-    return {
+    const resolved: ResolvedConflict = {
       field: fieldName,
       ourValue: JSON.stringify(ourDeps, null, 2),
       theirValue: JSON.stringify(theirDeps, null, 2),
       resolvedValue: JSON.stringify(merged, null, 2),
-      strategy: this.options.strategy,
+      strategy: picked > 0 && picked === conflicted ? "pick" : this.options.strategy,
     }
+    if (conflicted === 1 && specs.length === 1) {
+      resolved.package = specs[0] as string
+    }
+    return resolved
   }
 
   /**
@@ -723,7 +1060,13 @@ export class PackageResolver {
     return content
   }
 
-  private mergeValue(path: string[], baseValue: any, ourValue: any, theirValue: any): MergeOutcome {
+  private mergeValue(
+    path: string[],
+    baseValue: any,
+    ourValue: any,
+    theirValue: any,
+    context: MergeContext
+  ): MergeOutcome {
     if (ourValue === undefined && theirValue === undefined) {
       return {value: undefined, conflicts: []}
     }
@@ -761,42 +1104,53 @@ export class PackageResolver {
       this.isPlainObject(theirValue) &&
       this.isLockEntryConflict(path, ourValue, theirValue)
     ) {
-      return this.mergeLockPackageEntry(path, ourValue, theirValue)
+      return this.mergeLockPackageEntry(path, baseValue, ourValue, theirValue, context)
     }
 
     if (this.isPlainObject(ourValue) && this.isPlainObject(theirValue)) {
-      return this.mergeObjectValues(path, this.asPlainObject(baseValue), ourValue, theirValue)
+      return this.mergeObjectValues(path, this.asPlainObject(baseValue), ourValue, theirValue, context)
     }
 
     if (Array.isArray(ourValue) && Array.isArray(theirValue)) {
-      return this.mergeArrayValues(path, baseValue, ourValue, theirValue)
+      return this.mergeArrayValues(path, baseValue, ourValue, theirValue, context)
     }
 
-    return this.resolveLeafConflict(path, ourValue, theirValue)
+    return this.resolveLeafConflict(path, baseValue, ourValue, theirValue, context)
   }
 
   private mergeObjectValues(
     path: string[],
     baseValue: Record<string, any> | undefined,
     ourValue: Record<string, any>,
-    theirValue: Record<string, any>
+    theirValue: Record<string, any>,
+    context: MergeContext
   ): MergeOutcome {
     const merged: Record<string, any> = {}
     const conflicts: ResolvedConflict[] = []
+    const packageConflicts: PackageConflict[] = []
     const keys = this.orderedUnion(Object.keys(ourValue), Object.keys(theirValue), Object.keys(baseValue || {}))
 
     for (const key of keys) {
-      const mergedChild = this.mergeValue(path.concat(key), baseValue?.[key], ourValue[key], theirValue[key])
+      const mergedChild = this.mergeValue(path.concat(key), baseValue?.[key], ourValue[key], theirValue[key], context)
       if (mergedChild.value !== undefined) {
         merged[key] = mergedChild.value
       }
       conflicts.push(...mergedChild.conflicts)
+      if (mergedChild.packageConflicts !== undefined) {
+        packageConflicts.push(...mergedChild.packageConflicts)
+      }
     }
 
-    return {value: merged, conflicts}
+    return {value: merged, conflicts, packageConflicts}
   }
 
-  private mergeArrayValues(path: string[], baseValue: any, ourValue: any[], theirValue: any[]): MergeOutcome {
+  private mergeArrayValues(
+    path: string[],
+    baseValue: any,
+    ourValue: any[],
+    theirValue: any[],
+    context: MergeContext
+  ): MergeOutcome {
     if (Array.isArray(baseValue)) {
       if (isDeepStrictEqual(ourValue, baseValue)) {
         return {value: theirValue, conflicts: []}
@@ -820,7 +1174,7 @@ export class PackageResolver {
       }
     }
 
-    return this.resolveLeafConflict(path, ourValue, theirValue)
+    return this.resolveLeafConflict(path, baseValue, ourValue, theirValue, context)
   }
 
   /**
@@ -861,13 +1215,18 @@ export class PackageResolver {
   }
 
   /**
-   * Resolve a lockfile entry conflict atomically: pick the side whose version
-   * wins under the strategy and keep all of its correlated fields together.
+   * Resolve a lockfile entry conflict atomically: keep the side whose version
+   * wins under the strategy, with all of its correlated fields together. When
+   * a version was picked for the package, the side whose locked version
+   * satisfies the pick is kept instead (the strategy still decides when both
+   * or neither do).
    */
   private mergeLockPackageEntry(
     path: string[],
+    baseValue: any,
     ourValue: Record<string, any>,
-    theirValue: Record<string, any>
+    theirValue: Record<string, any>,
+    context: MergeContext
   ): MergeOutcome {
     let winner: Record<string, any>
 
@@ -885,30 +1244,133 @@ export class PackageResolver {
       winner = this.options.strategy === "theirs" ? theirValue : ourValue
     }
 
-    return {
+    const found = packageAt(path, context)
+    const ref = found?.kind === "lock" ? found : undefined
+    const pick = ref !== undefined ? this.picks.get(ref.name) : undefined
+    let resolvedBy: string = this.options.strategy
+    if (ref !== undefined && pick !== undefined) {
+      const ourMatches = lockedVersionSatisfies(ourValue, ref.name, pick)
+      const theirMatches = lockedVersionSatisfies(theirValue, ref.name, pick)
+      if (ourMatches !== theirMatches) {
+        winner = ourMatches ? ourValue : theirValue
+      }
+      if (ourMatches || theirMatches) {
+        resolvedBy = "pick"
+      }
+    }
+
+    const outcome: MergeOutcome = {
       value: winner,
-      conflicts: [this.createConflictRecord(path, ourValue, theirValue, winner)],
+      conflicts: [this.createConflictRecord(path, ourValue, theirValue, winner, resolvedBy, ref?.name)],
     }
+    if (ref?.listed) {
+      outcome.packageConflicts = [
+        this.packageConflict(
+          ref,
+          path,
+          {
+            base: this.isPlainObject(baseValue) ? describeLockEntry(baseValue) : undefined,
+            ours: describeLockEntry(ourValue),
+            theirs: describeLockEntry(theirValue),
+            resolved: describeLockEntry(winner),
+          },
+          resolvedBy,
+          pick
+        ),
+      ]
+    }
+    return outcome
   }
 
-  private resolveLeafConflict(path: string[], ourValue: any, theirValue: any): MergeOutcome {
-    const resolution = this.shouldResolveAsVersion(path, ourValue, theirValue)
-      ? VersionResolver.resolveVersion(String(ourValue), String(theirValue), this.options.strategy)
-      : VersionResolver.resolveNonVersion(ourValue, theirValue, this.options.strategy)
+  /**
+   * Resolve a conflict on a single value. A version picked for the package
+   * whose spec the value is wins; otherwise the strategy decides.
+   */
+  private resolveLeafConflict(
+    path: string[],
+    baseValue: any,
+    ourValue: any,
+    theirValue: any,
+    context: MergeContext
+  ): MergeOutcome {
+    const found = packageAt(path, context)
+    const ref = found?.kind === "spec" ? found : undefined
+    const pick = ref !== undefined ? this.picks.get(ref.name) : undefined
 
-    return {
-      value: resolution.resolved,
-      conflicts: [this.createConflictRecord(path, ourValue, theirValue, resolution.resolved)],
+    let resolved: any
+    if (pick !== undefined) {
+      resolved = pick
+    } else {
+      const resolution = this.shouldResolveAsVersion(path, ourValue, theirValue)
+        ? VersionResolver.resolveVersion(String(ourValue), String(theirValue), this.options.strategy)
+        : VersionResolver.resolveNonVersion(ourValue, theirValue, this.options.strategy)
+      resolved = resolution.resolved
     }
+    const resolvedBy = pick !== undefined ? "pick" : this.options.strategy
+
+    const outcome: MergeOutcome = {
+      value: resolved,
+      conflicts: [this.createConflictRecord(path, ourValue, theirValue, resolved, resolvedBy, ref?.name)],
+    }
+    if (ref !== undefined) {
+      outcome.packageConflicts = [
+        this.packageConflict(
+          ref,
+          path,
+          {
+            base: baseValue !== undefined ? this.stringifyConflictValue(baseValue) : undefined,
+            ours: this.stringifyConflictValue(ourValue),
+            theirs: this.stringifyConflictValue(theirValue),
+            resolved: this.stringifyConflictValue(resolved),
+          },
+          resolvedBy,
+          pick
+        ),
+      ]
+    }
+    return outcome
   }
 
-  private createConflictRecord(path: string[], ourValue: any, theirValue: any, resolvedValue: any): ResolvedConflict {
-    return {
+  private createConflictRecord(
+    path: string[],
+    ourValue: any,
+    theirValue: any,
+    resolvedValue: any,
+    strategy: string = this.options.strategy,
+    packageName?: string
+  ): ResolvedConflict {
+    const record: ResolvedConflict = {
       field: this.formatPath(path),
       ourValue: this.stringifyConflictValue(ourValue),
       theirValue: this.stringifyConflictValue(theirValue),
       resolvedValue: this.stringifyConflictValue(resolvedValue),
-      strategy: this.options.strategy,
+      strategy,
+    }
+    if (packageName !== undefined) {
+      record.package = packageName
+    }
+    return record
+  }
+
+  /** A package conflict record, with the optional fields only when they are known */
+  private packageConflict(
+    ref: PackageRef,
+    path: string[],
+    values: {base?: string | undefined; ours: string; theirs: string; resolved: string},
+    resolvedBy: string,
+    pick: string | undefined
+  ): PackageConflict {
+    return {
+      name: ref.name,
+      kind: ref.kind,
+      location: ref.location,
+      path,
+      ours: values.ours,
+      theirs: values.theirs,
+      ...(values.base !== undefined ? {base: values.base} : {}),
+      resolved: values.resolved,
+      resolvedBy,
+      ...(pick !== undefined ? {pick} : {}),
     }
   }
 

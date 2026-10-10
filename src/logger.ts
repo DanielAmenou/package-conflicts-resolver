@@ -12,7 +12,7 @@ export class Logger {
   }
 
   info(message: string, data?: any): void {
-    if (this.options.quiet) return
+    if (this.options.quiet || this.options.silent) return
 
     if (this.options.json) {
       console.log(
@@ -32,7 +32,7 @@ export class Logger {
   }
 
   success(message: string, data?: any): void {
-    if (this.options.quiet) return
+    if (this.options.quiet || this.options.silent) return
 
     if (this.options.json) {
       console.log(
@@ -52,6 +52,8 @@ export class Logger {
   }
 
   warn(message: string, data?: any): void {
+    if (this.options.silent) return
+
     if (this.options.json) {
       console.log(
         JSON.stringify({
@@ -70,6 +72,8 @@ export class Logger {
   }
 
   error(message: string, data?: any): void {
+    if (this.options.silent) return
+
     if (this.options.json) {
       console.error(
         JSON.stringify({
@@ -88,7 +92,7 @@ export class Logger {
   }
 
   debug(message: string, data?: any): void {
-    if (!this.options.verbose || this.options.quiet) return
+    if (!this.options.verbose || this.options.quiet || this.options.silent) return
 
     if (this.options.json) {
       console.log(
@@ -108,7 +112,7 @@ export class Logger {
   }
 
   logConflicts(conflicts: ResolvedConflict[]): void {
-    if (this.options.quiet) return
+    if (this.options.quiet || this.options.silent) return
 
     if (this.options.json) {
       console.log(
@@ -134,7 +138,7 @@ export class Logger {
   }
 
   summary(resolved: number, total: number, dryRun: boolean): void {
-    if (this.options.quiet) return
+    if (this.options.quiet || this.options.silent) return
 
     const message = dryRun ? `Would resolve ${resolved}/${total} conflicts` : `Resolved ${resolved}/${total} conflicts`
 

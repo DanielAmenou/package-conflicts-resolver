@@ -5,12 +5,11 @@
 import {strict as assert} from "assert"
 import {test, describe} from "node:test"
 import {spawn} from "child_process"
-import {writeFile, unlink, readFile, mkdtemp, rm} from "fs/promises"
+import {writeFile, readFile, mkdtemp, rm} from "fs/promises"
 import {tmpdir} from "os"
 import {join} from "path"
 
 describe("CLI Integration Tests", () => {
-  const testFile = join(process.cwd(), "test-package.json")
   const cliPath = join(process.cwd(), "dist", "cli.js")
 
   async function runCli(
@@ -139,11 +138,26 @@ describe("CLI Integration Tests", () => {
     return {repoDir, defaultBranch}
   }
 
-  async function cleanup() {
+  /**
+   * Run `fn` with a test-package.json holding `content` in a fresh temporary
+   * folder, never in the repository itself: another test run in the same
+   * checkout (an editor's test runner, watch mode, a second terminal) would
+   * race these tests on one shared file, and resolving a file next to the
+   * repository's package-lock.json would regenerate the project's own lockfile.
+   */
+  async function withTestFile(
+    content: string | undefined,
+    fn: (testFile: string, dir: string) => Promise<void>
+  ): Promise<void> {
+    const dir = await mkdtemp(join(tmpdir(), "package-conflicts-resolver-"))
     try {
-      await unlink(testFile)
-    } catch {
-      // Ignore if file doesn't exist
+      const testFile = join(dir, "test-package.json")
+      if (content !== undefined) {
+        await writeFile(testFile, content)
+      }
+      await fn(testFile, dir)
+    } finally {
+      await rm(dir, {recursive: true, force: true})
     }
   }
 
@@ -170,14 +184,12 @@ describe("CLI Integration Tests", () => {
 >>>>>>> feature
 }`
 
-    await writeFile(testFile, conflictedContent)
+    await withTestFile(conflictedContent, async (testFile, dir) => {
+      const result = await runCli(["--dry-run", testFile], dir)
 
-    const result = await runCli(["--dry-run", testFile])
-
-    assert.equal(result.exitCode, 0)
-    assert(result.stdout.includes("Resolved") || result.stdout.includes("conflicts"))
-
-    await cleanup()
+      assert.equal(result.exitCode, 0)
+      assert(result.stdout.includes("Resolved") || result.stdout.includes("conflicts"))
+    })
   })
 
   test("should use different strategies", async () => {
@@ -190,21 +202,19 @@ describe("CLI Integration Tests", () => {
 >>>>>>> feature
 }`
 
-    await writeFile(testFile, conflictedContent)
+    await withTestFile(conflictedContent, async (testFile, dir) => {
+      // Test highest strategy (default)
+      const highestResult = await runCli(["--dry-run", "--strategy", "highest", testFile], dir)
+      assert.equal(highestResult.exitCode, 0)
 
-    // Test highest strategy (default)
-    const highestResult = await runCli(["--dry-run", "--strategy", "highest", testFile])
-    assert.equal(highestResult.exitCode, 0)
+      // Test lowest strategy
+      const lowestResult = await runCli(["--dry-run", "--strategy", "lowest", testFile], dir)
+      assert.equal(lowestResult.exitCode, 0)
 
-    // Test lowest strategy
-    const lowestResult = await runCli(["--dry-run", "--strategy", "lowest", testFile])
-    assert.equal(lowestResult.exitCode, 0)
-
-    // Test ours strategy
-    const oursResult = await runCli(["--dry-run", "--strategy", "ours", testFile])
-    assert.equal(oursResult.exitCode, 0)
-
-    await cleanup()
+      // Test ours strategy
+      const oursResult = await runCli(["--dry-run", "--strategy", "ours", testFile], dir)
+      assert.equal(oursResult.exitCode, 0)
+    })
   })
 
   test("should output JSON when requested", async () => {
@@ -217,21 +227,19 @@ describe("CLI Integration Tests", () => {
 >>>>>>> feature
 }`
 
-    await writeFile(testFile, conflictedContent)
+    await withTestFile(conflictedContent, async (testFile, dir) => {
+      const result = await runCli(["--dry-run", "--json", testFile], dir)
 
-    const result = await runCli(["--dry-run", "--json", testFile])
+      assert.equal(result.exitCode, 0)
 
-    assert.equal(result.exitCode, 0)
-
-    // Should contain JSON output
-    const lines = result.stdout.trim().split("\n")
-    for (const line of lines) {
-      if (line.trim()) {
-        assert.doesNotThrow(() => JSON.parse(line), "Output should be valid JSON")
+      // Should contain JSON output
+      const lines = result.stdout.trim().split("\n")
+      for (const line of lines) {
+        if (line.trim()) {
+          assert.doesNotThrow(() => JSON.parse(line), "Output should be valid JSON")
+        }
       }
-    }
-
-    await cleanup()
+    })
   })
 
   test("should be quiet when requested", async () => {
@@ -244,28 +252,30 @@ describe("CLI Integration Tests", () => {
 >>>>>>> feature
 }`
 
-    await writeFile(testFile, conflictedContent)
+    await withTestFile(conflictedContent, async (testFile, dir) => {
+      const result = await runCli(["--dry-run", "--quiet", testFile], dir)
 
-    const result = await runCli(["--dry-run", "--quiet", testFile])
-
-    assert.equal(result.exitCode, 0)
-    assert.equal(result.stdout.trim(), "") // Should be quiet
-
-    await cleanup()
+      assert.equal(result.exitCode, 0)
+      assert.equal(result.stdout.trim(), "") // Should be quiet
+    })
   })
 
   test("should handle non-existent file", async () => {
-    const result = await runCli(["non-existent-file.json"])
+    await withTestFile(undefined, async (_testFile, dir) => {
+      const result = await runCli(["non-existent-file.json"], dir)
 
-    assert.notEqual(result.exitCode, 0)
-    assert(result.stderr.includes("not found") || result.stderr.includes("ENOENT"))
+      assert.notEqual(result.exitCode, 0)
+      assert(result.stderr.includes("not found") || result.stderr.includes("ENOENT"))
+    })
   })
 
   test("should handle invalid strategy", async () => {
-    const result = await runCli(["--strategy", "invalid", testFile])
+    await withTestFile(undefined, async (testFile, dir) => {
+      const result = await runCli(["--strategy", "invalid", testFile], dir)
 
-    assert.notEqual(result.exitCode, 0)
-    assert(result.stderr.includes("Invalid strategy"))
+      assert.notEqual(result.exitCode, 0)
+      assert(result.stderr.includes("Invalid strategy"))
+    })
   })
 
   test("should actually resolve conflicts when not dry-run", async () => {
@@ -278,22 +288,20 @@ describe("CLI Integration Tests", () => {
 >>>>>>> feature
 }`
 
-    await writeFile(testFile, conflictedContent)
+    await withTestFile(conflictedContent, async (testFile, dir) => {
+      const result = await runCli([testFile], dir)
 
-    const result = await runCli([testFile])
+      assert.equal(result.exitCode, 0)
 
-    assert.equal(result.exitCode, 0)
+      // Check that file was actually modified
+      const resolvedContent = await readFile(testFile, "utf8")
+      assert(!resolvedContent.includes("<<<<<<<"))
+      assert(!resolvedContent.includes("======="))
+      assert(!resolvedContent.includes(">>>>>>>"))
 
-    // Check that file was actually modified
-    const resolvedContent = await readFile(testFile, "utf8")
-    assert(!resolvedContent.includes("<<<<<<<"))
-    assert(!resolvedContent.includes("======="))
-    assert(!resolvedContent.includes(">>>>>>>"))
-
-    // Should be valid JSON
-    assert.doesNotThrow(() => JSON.parse(resolvedContent))
-
-    await cleanup()
+      // Should be valid JSON
+      assert.doesNotThrow(() => JSON.parse(resolvedContent))
+    })
   })
 
   test("should handle file without conflicts", async () => {
@@ -305,26 +313,21 @@ describe("CLI Integration Tests", () => {
   }
 }`
 
-    await writeFile(testFile, cleanContent)
+    await withTestFile(cleanContent, async (testFile, dir) => {
+      const result = await runCli([testFile], dir)
 
-    const result = await runCli([testFile])
-
-    assert.equal(result.exitCode, 0)
-    assert(
-      result.stdout.includes("No conflicts found") ||
-        result.stdout.includes("No Git conflict markers found") ||
-        result.stdout.includes("0") ||
-        result.stdout.length === 0
-    )
-
-    await cleanup()
+      assert.equal(result.exitCode, 0)
+      assert(
+        result.stdout.includes("No conflicts found") ||
+          result.stdout.includes("No Git conflict markers found") ||
+          result.stdout.includes("0") ||
+          result.stdout.length === 0
+      )
+    })
   })
 
   test("should work with default package.json", async () => {
-    // Create a test package.json in a temp directory or use a different approach
-    // For now, just test that the CLI accepts default package.json argument
-    const tempPackageJson = join(process.cwd(), "temp-package.json")
-
+    // Test that the CLI accepts a package.json argument, in a temporary folder
     const conflictedContent = `{
   "name": "test-package",
 <<<<<<< HEAD
@@ -334,18 +337,14 @@ describe("CLI Integration Tests", () => {
 >>>>>>> feature
 }`
 
-    await writeFile(tempPackageJson, conflictedContent)
+    await withTestFile(undefined, async (_testFile, dir) => {
+      const tempPackageJson = join(dir, "temp-package.json")
+      await writeFile(tempPackageJson, conflictedContent)
 
-    const result = await runCli(["--dry-run", tempPackageJson])
+      const result = await runCli(["--dry-run", tempPackageJson], dir)
 
-    assert.equal(result.exitCode, 0)
-
-    // Cleanup
-    try {
-      await unlink(tempPackageJson)
-    } catch {
-      // Ignore cleanup errors
-    }
+      assert.equal(result.exitCode, 0)
+    })
   })
 
   test("should resolve a real git-generated package.json conflict", async () => {
