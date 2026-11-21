@@ -279,16 +279,39 @@ function setAt(document: Record<string, any>, path: string[], value: unknown, {f
   }
   const key = path[path.length - 1] as string
   if (!first) {
-    parent[key] = value
+    setOwn(parent, key, value)
     return
   }
   const others = Object.entries(parent).filter(([name]) => name !== key)
   for (const name of Object.keys(parent)) {
     delete parent[name]
   }
-  parent[key] = value
+  setOwn(parent, key, value)
   for (const [name, entry] of others) {
-    parent[name] = entry
+    setOwn(parent, name, entry)
+  }
+}
+
+/**
+ * The value of a key of an object: undefined when the object itself does not
+ * have the key. A plain lookup also finds what every object inherits, and
+ * would read a dependency named "constructor" or "toString" that a branch
+ * does not have as a function.
+ */
+function ownValue(object: Record<string, any> | undefined, key: string): any {
+  return object !== undefined && Object.hasOwn(object, key) ? object[key] : undefined
+}
+
+/**
+ * Give an object a key with a value. JSON allows any key, while an assignment
+ * to "__proto__" would change the object's prototype instead, or be ignored
+ * for a string, and the value would be lost.
+ */
+function setOwn(object: Record<string, any>, key: string, value: unknown): void {
+  if (key === "__proto__") {
+    Object.defineProperty(object, key, {value, enumerable: true, writable: true, configurable: true})
+  } else {
+    object[key] = value
   }
 }
 
@@ -1040,13 +1063,13 @@ export class PackageResolver {
 
     // First add all our dependencies in their original order
     for (const [packageName, ourVersion] of Object.entries(ourDeps)) {
-      merged[packageName] = ourVersion
+      setOwn(merged, packageName, ourVersion)
     }
 
     // Then add their dependencies that we don't have, maintaining their order
     for (const [packageName, theirVersion] of Object.entries(theirDeps)) {
-      if (!(packageName in merged)) {
-        merged[packageName] = theirVersion
+      if (!Object.hasOwn(merged, packageName)) {
+        setOwn(merged, packageName, theirVersion)
       } else {
         // Defined, since the package is in merged
         const ourVersion = merged[packageName]
@@ -1075,7 +1098,7 @@ export class PackageResolver {
             }
           }
           const resolvedVersion = pick ?? (resolution as VersionResolution).resolved
-          merged[packageName] = resolvedVersion
+          setOwn(merged, packageName, resolvedVersion)
           conflicted++
           picked += pick !== undefined ? 1 : 0
 
@@ -1475,9 +1498,15 @@ export class PackageResolver {
     const keys = mergedKeyOrder(Object.keys(ourValue), Object.keys(theirValue))
 
     for (const key of keys) {
-      const mergedChild = this.mergeValue(path.concat(key), baseValue?.[key], ourValue[key], theirValue[key], context)
+      const mergedChild = this.mergeValue(
+        path.concat(key),
+        ownValue(baseValue, key),
+        ownValue(ourValue, key),
+        ownValue(theirValue, key),
+        context
+      )
       if (mergedChild.value !== undefined) {
-        merged[key] = mergedChild.value
+        setOwn(merged, key, mergedChild.value)
       }
       conflicts.push(...mergedChild.conflicts)
       if (mergedChild.packageConflicts !== undefined) {
