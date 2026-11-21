@@ -430,7 +430,8 @@ export class PackageResolver {
    * not brought back by a conflict next to it. That only holds while the
    * content is still what Git wrote: once it was edited, or resolved in part,
    * the markers are what is left to resolve, and the versions are not used.
-   * Neither are versions that cannot be read as JSON objects.
+   * Neither are versions that cannot be read as JSON objects. With
+   * `versions.writtenByGit`, the content is taken to be Git's merge as it is.
    */
   async resolveConflicts(content: string, versions?: MergeVersions): Promise<ResolutionResult> {
     const result: ResolutionResult = {
@@ -538,11 +539,11 @@ export class PackageResolver {
    * otherwise, and when they cannot be compared: the conflict markers decide.
    */
   private resolveFromVersions(content: string, versions: MergeVersions): ResolutionResult | null {
-    const check = compareWithVersions(content, versions)
+    const check = versions.writtenByGit === true ? "follows" : compareWithVersions(content, versions)
     if (check !== "follows") {
       this.logger.info(
         check === "changed"
-          ? "The file was edited or resolved in part since the merge: resolving what is left between its conflict markers"
+          ? "The file does not match Git's merge of its versions in the index, as when it was edited or resolved in part since: resolving what is left between its conflict markers"
           : "The file cannot be compared with its versions in Git's index: resolving from its conflict markers"
       )
       return null

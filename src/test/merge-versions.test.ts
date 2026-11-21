@@ -39,7 +39,7 @@ type ConflictStyle = "merge" | "diff3" | "zdiff3"
 interface Merge {
   /** The file as Git leaves it in the work tree, with conflict markers */
   content: string
-  versions: Required<MergeVersions>
+  versions: Required<Omit<MergeVersions, "writtenByGit">>
 }
 
 /** Git's line merge of three versions of a document, as `git merge` leaves it: in the file, and in the index */
@@ -360,6 +360,60 @@ describe("a file changed after Git wrote it is resolved from its markers", () =>
 })
 
 describe("what Git's line merge leaves in a file", () => {
+  test("lines it stitched together from two entries do not read as a merge, but its versions merge with writtenByGit", async () => {
+    const entry = (version: string, extra: Record<string, unknown> = {}) => ({
+      version,
+      dev: true,
+      ...extra,
+      license: "MIT",
+    })
+    const lockfile = (packages: Record<string, unknown>) => j({name: "app", lockfileVersion: 3, packages})
+    const versions = {
+      base: lockfile({
+        "node_modules/a": entry("1.0.0", {funding: {url: "x"}}),
+        "node_modules/b": entry("1.0.0", {funding: {url: "x"}}),
+        "node_modules/c": entry("1.0.0", {dependencies: {z: "^1.0.0"}}),
+      }),
+      // We upgraded a and removed b; they removed a and c, and b's funding
+      ours: lockfile({
+        "node_modules/a": entry("1.1.0", {funding: {url: "x"}}),
+        "node_modules/c": entry("1.0.0", {dependencies: {z: "^1.0.0"}}),
+      }),
+      theirs: lockfile({"node_modules/b": entry("1.0.0")}),
+    }
+    // What `git merge` writes: the end of entry a, on both sides, is the end of entry b
+    const content = [
+      "{",
+      '  "name": "app",',
+      '  "lockfileVersion": 3,',
+      '  "packages": {',
+      "<<<<<<< HEAD",
+      '    "node_modules/a": {',
+      '      "version": "1.1.0",',
+      "=======",
+      '    "node_modules/b": {',
+      '      "version": "1.0.0",',
+      ">>>>>>> feature",
+      '      "dev": true,',
+      '      "license": "MIT"',
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n")
+    assert.equal(compareWithVersions(content, versions), "changed")
+
+    // From the markers, entry a has lost its funding, which both branches had
+    const fromMarkers = await resolver().resolveConflicts(content, versions)
+    assert.deepEqual(fromMarkers.packageJson!.packages["node_modules/a"], {version: "1.1.0", dev: true, license: "MIT"})
+
+    const result = await resolver().resolveConflicts(content, {...versions, writtenByGit: true})
+    assert.deepEqual(result.packageJson!.packages, {
+      "node_modules/a": entry("1.1.0", {funding: {url: "x"}}),
+      "node_modules/b": entry("1.0.0"),
+    })
+  })
+
   test("lists that Git merged line by line follow the versions; an item removed by hand does not", async () => {
     const {content, versions} = await gitMerge(
       {name: "app", version: "1.0.0", files: ["dist", "lib", "types"], keywords: ["a"]},

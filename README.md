@@ -122,6 +122,9 @@ Strategies only decide **real conflicts**: fields that both branches changed to 
   From the markers alone, `left-pad` could have been added by their branch or removed by ours. The index tells that our branch removed it: it stays removed, `express` is added, and `lodash` is the only conflict.
 
 - **A file you changed after the merge**: once a conflict was resolved by hand, a value was edited, or an earlier run decided some values and left others for you, the versions in the index no longer describe the file. The command notices, and resolves what is still between conflict markers, leaving everything else as it is. `diff3`/`zdiff3` markers carry the ancestor themselves; with default markers every difference between the two sides is then a conflict.
+
+  Git merges line by line, and in a lockfile, whose entries look alike, it sometimes stitches lines of one entry to the end of another. Such a file reads as if it had been edited, so the command asks Git whether it is exactly Git's own merge, by merging the versions again with `git merge-file`. That needs a Git whose `merge-file` has the `--object-id` and `--diff-algorithm` options; with an older Git such a lockfile is resolved from its conflict markers.
+
 - **Outside a Git repository**, or for a file Git does not list as conflicted, only the markers are there to go by, in the same way.
 
 Lists of plain values, such as `files`, `keywords`, `os` or `workspaces`, merge item by item against the common ancestor: an item either branch added is kept, and an item either branch removed stays removed. Without the ancestor, the two lists are combined. Lists of objects are decided as a whole.
@@ -571,9 +574,9 @@ package-conflicts-resolver verify
 - Run `package-conflicts-resolver verify` to check your setup.
 - When the message adds that Git still lists the file as conflicted, the file was resolved without being staged, or a merge driver failed and left one branch's version in place. Check that the file has the changes of both branches, then `git add` it.
 
-**"The file was edited or resolved in part since the merge"**
+**"The file does not match Git's merge of its versions in the index"**
 
-- The file is no longer what Git's merge left: a conflict was resolved by hand, a value was edited, or an earlier run (or the merge driver) left values for you to decide. What was decided is kept, and only what is still between conflict markers is resolved. See [Where the common ancestor comes from](#where-the-common-ancestor-comes-from).
+- The file is no longer what Git's merge left: a conflict was resolved by hand, a value was edited, or an earlier run (or the merge driver) left values for you to decide. What was decided is kept, and only what is still between conflict markers is resolved. With a Git too old to check a lockfile whose lines its merge stitched together, the message can also appear for a lockfile you did not touch. See [Where the common ancestor comes from](#where-the-common-ancestor-comes-from).
 
 **"Lockfiles were not regenerated: ... still has conflicts"**
 

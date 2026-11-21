@@ -13,7 +13,8 @@ import {strict as assert} from "assert"
 import {test, describe} from "node:test"
 import {readFile, rm, writeFile} from "fs/promises"
 import {join} from "node:path"
-import {findRepoRoot, listUnmerged, onBothBranches, readMergeVersions} from "../git.js"
+import {findRepoRoot, isGitMergeOutput, listUnmerged, onBothBranches, readMergeVersions} from "../git.js"
+import {compareWithVersions} from "../merge-versions.js"
 import {
   CLI_PATH,
   STUBS_NEED_POSIX,
@@ -258,7 +259,7 @@ describe("the CLI goes by the conflict markers once the file was changed", () =>
 
       const result = await runCli(["--no-regenerate-lock"], dir)
       assert.equal(result.code, 0, result.stderr)
-      assert.match(result.stdout, /The file was edited or resolved in part since the merge/)
+      assert.match(result.stdout, /The file does not match Git's merge of its versions in the index/)
 
       const merged = await readJson(dir, "package.json")
       assert.equal(merged.description, "mine")
@@ -346,6 +347,8 @@ describe("reading Git's index", () => {
         ours: pkg({a: "^1.0.0"}),
         theirs: pkg({a: "^2.0.0"}),
       })
+      const content = await readFile(join(dir, "package.json"), "utf8")
+      assert.equal(await isGitMergeOutput(join(dir, "package.json"), content), false, "there is nothing to merge from")
     })
   })
 
@@ -383,6 +386,96 @@ describe("reading Git's index", () => {
       assert.equal(await findRepoRoot(dir), dir)
       assert.equal(await findRepoRoot(join(dir, "packages", "a", "src")), dir)
       assert.equal(await findRepoRoot(join(dir, ".git")), undefined)
+    })
+  })
+})
+
+describe("a lockfile whose lines Git's merge stitched together", () => {
+  const entry = (version: string, extra: Record<string, unknown> = {}) => ({
+    version,
+    dev: true,
+    ...extra,
+    license: "MIT",
+  })
+  const lockfile = (packages: Record<string, unknown>) => j({name: "app", lockfileVersion: 3, packages})
+  // We upgraded a and removed b; they removed a and c, and b's funding
+  const BASE_LOCK = lockfile({
+    "node_modules/a": entry("1.0.0", {funding: {url: "x"}}),
+    "node_modules/b": entry("1.0.0", {funding: {url: "x"}}),
+    "node_modules/c": entry("1.0.0", {dependencies: {z: "^1.0.0"}}),
+  })
+  const OUR_LOCK = lockfile({
+    "node_modules/a": entry("1.1.0", {funding: {url: "x"}}),
+    "node_modules/c": entry("1.0.0", {dependencies: {z: "^1.0.0"}}),
+  })
+  const THEIR_LOCK = lockfile({"node_modules/b": entry("1.0.0")})
+
+  /** Whether this Git's merge-file can merge the index versions as Git's merges do: older ones cannot */
+  async function mergeFileCanCheck(): Promise<boolean> {
+    const help = await git(process.cwd(), ["merge-file", "-h"], true)
+    // Listed as --[no-]object-id
+    return /object-id/.test(help.stdout) && /diff-algorithm/.test(help.stdout)
+  }
+
+  /** Merge the branches: the merged lockfile has lines of entry b in entry a, which no reading of its values explains */
+  async function stitchedMerge(dir: string): Promise<string> {
+    await conflictingMerge(
+      dir,
+      {"package.json": pkg({}), "package-lock.json": BASE_LOCK},
+      {"package-lock.json": OUR_LOCK},
+      {"package-lock.json": THEIR_LOCK}
+    )
+    const file = join(dir, "package-lock.json")
+    const content = await readFile(file, "utf8")
+    const versions = await readMergeVersions(file)
+    assert.equal(compareWithVersions(content, versions!), "changed", content)
+    return content
+  }
+
+  test("is recognized as Git's own merge, and merged from the versions", async t => {
+    if (!(await mergeFileCanCheck())) return t.skip("git merge-file is too old")
+    await withRepo(async dir => {
+      await stitchedMerge(dir)
+
+      const result = await runCli(["--no-regenerate-lock"], dir)
+      assert.equal(result.code, 0, result.stderr)
+      assert.match(result.stdout, /from Git's index/)
+      assert.doesNotMatch(result.stdout, /does not match/)
+      // From the markers, entry a would have lost its funding, which both branches had
+      assert.deepEqual((await readJson(dir, "package-lock.json")).packages, {
+        "node_modules/a": entry("1.1.0", {funding: {url: "x"}}),
+        "node_modules/b": entry("1.0.0"),
+      })
+    })
+  })
+
+  test("is recognized in every conflict style and with Windows line endings, and not once edited", async t => {
+    if (!(await mergeFileCanCheck())) return t.skip("git merge-file is too old")
+    await withRepo(async dir => {
+      const file = join(dir, "package-lock.json")
+      const merged = await stitchedMerge(dir)
+      assert.equal(await isGitMergeOutput(file, merged), true)
+      assert.equal(await isGitMergeOutput(file, merged.replace(/\n/g, "\r\n")), true)
+      assert.equal(await isGitMergeOutput(file, merged.replace('"license": "MIT"', '"license": "ISC"')), false)
+
+      for (const style of ["diff3", "zdiff3"]) {
+        await git(dir, ["checkout", `--conflict=${style}`, "package-lock.json"])
+        const content = await readFile(file, "utf8")
+        assert.match(content, /^\|{7} /m, style)
+        assert.equal(await isGitMergeOutput(file, content), true, style)
+        assert.equal(await isGitMergeOutput(file, content.replace('"dev": true', '"dev": false')), false, style)
+      }
+    })
+  })
+
+  test("a file that is not conflicted, or not in a repository, is never Git's merge", async () => {
+    await withRepo(async dir => {
+      await commitFiles(dir, {"package-lock.json": BASE_LOCK}, "base")
+      assert.equal(await isGitMergeOutput(join(dir, "package-lock.json"), BASE_LOCK), false)
+    })
+    await withTempDir(async dir => {
+      await writeFile(join(dir, "package-lock.json"), BASE_LOCK)
+      assert.equal(await isGitMergeOutput(join(dir, "package-lock.json"), "<<<<<<< HEAD\n=======\n>>>>>>> x\n"), false)
     })
   })
 })

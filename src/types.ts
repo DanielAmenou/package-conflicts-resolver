@@ -41,6 +41,14 @@ export interface MergeVersions {
   theirs: string
   /** The file in the common ancestor (index stage 1): none when both branches added the file */
   base?: string
+  /**
+   * Set when the conflicted content was found to be exactly the file Git's
+   * merge of these versions writes (the CLI checks with `git merge-file`):
+   * the versions are then merged without comparing the content with them.
+   * That comparison reads values, so it cannot recognize every file in which
+   * Git's line merge stitched together lines of different values.
+   */
+  writtenByGit?: boolean
 }
 
 export interface ResolutionStrategy {

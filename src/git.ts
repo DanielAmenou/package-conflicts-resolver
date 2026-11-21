@@ -29,16 +29,21 @@ interface UnmergedEntry {
 
 /**
  * Run Git and collect its output, undefined when Git cannot be started or
- * fails. The output is kept as bytes until it is complete: decoding it chunk
- * by chunk would break a character that falls on the boundary of two chunks.
+ * fails: exits with a code `succeeded` does not accept. The output is kept as
+ * bytes until it is complete: decoding it chunk by chunk would break a
+ * character that falls on the boundary of two chunks.
  */
-function git(args: string[], cwd: string): Promise<Buffer | undefined> {
+function git(
+  args: string[],
+  cwd: string,
+  succeeded: (code: number | null) => boolean = code => code === 0
+): Promise<Buffer | undefined> {
   return new Promise(resolvePromise => {
     const child = spawn("git", args, {cwd, stdio: ["ignore", "pipe", "ignore"], windowsHide: true})
     const chunks: Buffer[] = []
     child.stdout.on("data", chunk => chunks.push(chunk))
     child.on("error", () => resolvePromise(undefined))
-    child.on("close", code => resolvePromise(code === 0 ? Buffer.concat(chunks) : undefined))
+    child.on("close", code => resolvePromise(succeeded(code) ? Buffer.concat(chunks) : undefined))
   })
 }
 
@@ -109,13 +114,22 @@ export function onBothBranches(stages: Set<number> | undefined): boolean {
   return stages !== undefined && stages.has(STAGE_OURS) && stages.has(STAGE_THEIRS)
 }
 
+/** The index entries of a conflicted file, by stage, and the folder to ask Git about them in */
+interface MergeEntries {
+  dir: string
+  ours: UnmergedEntry
+  theirs: UnmergedEntry
+  /** None when both branches added the file */
+  base?: UnmergedEntry
+}
+
 /**
- * The versions of a conflicted file in Git's index. Undefined when the file
- * is not unmerged there, when a branch has no version of it (it deleted the
- * file, which leaves nothing to merge value by value), or when a version is
- * not a regular file.
+ * The index entries of a conflicted file. Undefined when the file is not
+ * unmerged there, when a branch has no version of it (it deleted the file,
+ * which leaves nothing to merge value by value), or when a version is not a
+ * regular file.
  */
-export async function readMergeVersions(filePath: string): Promise<MergeVersions | undefined> {
+async function mergeEntries(filePath: string): Promise<MergeEntries | undefined> {
   const path = resolve(filePath)
   const dir = dirname(path)
   const name = basename(path)
@@ -127,7 +141,17 @@ export async function readMergeVersions(filePath: string): Promise<MergeVersions
   if (ours === undefined || theirs === undefined || !entries.every(entry => REGULAR_FILE_MODES.has(entry.mode))) {
     return undefined
   }
+  return {dir, ours, theirs, ...(base !== undefined ? {base} : {})}
+}
 
+/** The versions of a conflicted file in Git's index: undefined when there are none to merge (see mergeEntries) */
+export async function readMergeVersions(filePath: string): Promise<MergeVersions | undefined> {
+  const entries = await mergeEntries(filePath)
+  if (entries === undefined) {
+    return undefined
+  }
+
+  const {dir, ours, theirs, base} = entries
   const read = async (entry: UnmergedEntry) => (await git(["cat-file", "blob", entry.object], dir))?.toString("utf8")
   const [ourText, theirText, baseText] = await Promise.all([
     read(ours),
@@ -138,4 +162,62 @@ export async function readMergeVersions(filePath: string): Promise<MergeVersions
     return undefined
   }
   return {ours: ourText, theirs: theirText, ...(baseText !== undefined ? {base: baseText} : {})}
+}
+
+/**
+ * Whether the content of a conflicted file is exactly what Git's merge of
+ * its versions in the index writes, apart from line endings: `git merge-file`
+ * merges them again, with the labels and the conflict style the file shows,
+ * and the histogram diff Git's merges use.
+ *
+ * That recognizes the file even where Git's merge, which works line by line,
+ * stitched together lines of different values, as it does in lockfiles, whose
+ * entries look alike: reading the values, such a file cannot be told from one
+ * edited by hand.
+ *
+ * False whenever it cannot be checked: without a common ancestor (both
+ * branches added the file), or with a Git whose `merge-file` lacks the
+ * options this needs.
+ */
+export async function isGitMergeOutput(filePath: string, content: string): Promise<boolean> {
+  const text = content.replace(/\r\n/g, "\n")
+  const ourLabel = /^<{7} (.*)$/m.exec(text)?.[1]
+  const theirLabel = /^>{7} (.*)$/m.exec(text)?.[1]
+  const baseLabel = /^\|{7} (.*)$/m.exec(text)?.[1]
+  if (ourLabel === undefined || theirLabel === undefined) {
+    return false
+  }
+
+  const entries = await mergeEntries(filePath)
+  if (entries?.base === undefined) {
+    return false
+  }
+  const {dir, ours, theirs, base} = entries
+
+  // The style the file shows: conflicts with the common ancestor's lines are diff3 or zdiff3
+  const styles =
+    baseLabel === undefined
+      ? [{config: ["-c", "merge.conflictStyle=merge"], flags: []}]
+      : [
+          {config: [], flags: ["--diff3"]},
+          {config: [], flags: ["--zdiff3"]},
+        ]
+  for (const {config, flags} of styles) {
+    const args = [
+      ...config,
+      "merge-file",
+      "--stdout",
+      "--object-id",
+      "--diff-algorithm=histogram",
+      ...flags,
+      ...["-L", ourLabel, "-L", baseLabel ?? "base", "-L", theirLabel],
+      ...[ours.object, base.object, theirs.object],
+    ]
+    // It exits with the number of conflicts, up to 127, and with more on an error
+    const merged = await git(args, dir, code => code !== null && code >= 0 && code <= 127)
+    if (merged !== undefined && merged.toString("utf8").replace(/\r\n/g, "\n") === text) {
+      return true
+    }
+  }
+  return false
 }

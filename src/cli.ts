@@ -13,7 +13,8 @@ import {readFile, access, writeFile} from "fs/promises"
 import {ConflictParser} from "./conflict-parser.js"
 import {PackageResolver} from "./package-resolver.js"
 import {Logger} from "./logger.js"
-import {listUnmerged, onBothBranches, readMergeVersions} from "./git.js"
+import {isGitMergeOutput, listUnmerged, onBothBranches, readMergeVersions} from "./git.js"
+import {compareWithVersions} from "./merge-versions.js"
 import {LOCKFILES, LockfileInfo, PackageManagerName, findLockfiles, resolveSafeRegenCommand} from "./package-manager.js"
 import {formatLockfileIssues, isNpmLockfile, validateLockfile} from "./lockfile-validator.js"
 import {spawnCommand} from "./process.js"
@@ -104,6 +105,20 @@ function lockfileLabel(lock: LockLocation, name: string): string {
 /** A command for the user to run, with the folder to run it in when that is neither the target's nor the current one */
 function commandHint(lock: LockLocation, command: string): string {
   return lock.place === undefined || lock.place === "." ? `"${command}"` : `"${command}" in ${lock.place}`
+}
+
+/**
+ * The versions of a conflicted file in Git's index, to resolve its content
+ * from (see PackageResolver.resolveConflicts). When reading its values does
+ * not show the content to be Git's merge of them, Git is asked whether it is
+ * exactly that merge, line for line (see isGitMergeOutput).
+ */
+async function indexVersions(filePath: string, content: string): Promise<MergeVersions | undefined> {
+  const versions = await readMergeVersions(filePath)
+  if (versions === undefined || compareWithVersions(content, versions) === "follows") {
+    return versions
+  }
+  return (await isGitMergeOutput(filePath, content)) ? {...versions, writtenByGit: true} : versions
 }
 
 /**
@@ -407,7 +422,7 @@ async function resolvePackageConflicts(options: CliOptions): Promise<void> {
 
     // Create resolver and resolve conflicts, from the versions in Git's index when the file is still Git's merge of them
     const resolver = new PackageResolver(options)
-    const result = await resolver.resolveConflicts(content, await readMergeVersions(filePath))
+    const result = await resolver.resolveConflicts(content, await indexVersions(filePath, content))
 
     if (!result.resolved) {
       console.error(`❌ Failed to resolve conflicts: ${result.errors.join(", ")}`)
@@ -762,7 +777,7 @@ async function analyzeConflicts(
   let failed = false
   const analyze = async (file: string, path: string, text: string) => {
     const resolver = new PackageResolver({...options, silent: true})
-    const result = await resolver.resolveConflicts(text, await readMergeVersions(path))
+    const result = await resolver.resolveConflicts(text, await indexVersions(path, text))
     failed = failed || !result.resolved
     files.push(reportFile(file, result))
   }
@@ -1100,7 +1115,7 @@ async function resolveCompanionLockfiles(
     // npm lockfiles are JSON: merge them semantically
     if (lockfile.jsonMergeable) {
       const resolver = new PackageResolver({...options, file: lockPath})
-      const result = await resolver.resolveConflicts(lockContent, await readMergeVersions(lockPath))
+      const result = await resolver.resolveConflicts(lockContent, await indexVersions(lockPath, lockContent))
 
       if (result.resolved && result.packageJson) {
         await resolver.writeResolvedPackage(result.packageJson, lockPath, lockContent)
