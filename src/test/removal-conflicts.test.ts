@@ -104,9 +104,9 @@ describe("a dependency one branch removed and the other changed", () => {
       assert.deepEqual(
         result.conflicts.map(conflict => [conflict.field, conflict.resolvedValue, conflict.strategy]),
         [
+          ["dependencies.lodash", "<deleted>", "removal"],
           ["dependencies.react", react, strategy],
           ["dependencies.zod", "<deleted>", "removal"],
-          ["dependencies.lodash", "<deleted>", "removal"],
         ]
       )
       // The removed script is no dependency: it is left for the user
@@ -120,6 +120,17 @@ describe("a dependency one branch removed and the other changed", () => {
   test("the package conflicts say which branch removed it, and the change that was dropped", async () => {
     const result = await resolver().mergeJsonContents(j(BASE), j(OURS), j(THEIRS))
     assert.deepEqual(result.packageConflicts, [
+      {
+        name: "lodash",
+        kind: "spec",
+        location: "dependencies",
+        path: ["dependencies", "lodash"],
+        ours: null,
+        theirs: "^4.17.21",
+        base: "^4.17.20",
+        resolved: null,
+        resolvedBy: "removal",
+      },
       {
         name: "react",
         kind: "spec",
@@ -139,17 +150,6 @@ describe("a dependency one branch removed and the other changed", () => {
         ours: "^3.23.0",
         theirs: null,
         base: "^3.22.0",
-        resolved: null,
-        resolvedBy: "removal",
-      },
-      {
-        name: "lodash",
-        kind: "spec",
-        location: "dependencies",
-        path: ["dependencies", "lodash"],
-        ours: null,
-        theirs: "^4.17.21",
-        base: "^4.17.20",
         resolved: null,
         resolvedBy: "removal",
       },
@@ -197,9 +197,9 @@ describe("a dependency one branch removed and the other changed", () => {
       ]),
       [
         ["scripts.lint", "<deleted>", "eslint --fix .", "<deleted>"],
+        ["dependencies.lodash", "<deleted>", "^4.17.21", "<deleted>"],
         ["dependencies.react", "^18.3.0", "^18.3.1", "^18.3.0"],
         ["dependencies.zod", "^3.23.0", "<deleted>", "^3.23.0"],
-        ["dependencies.lodash", "<deleted>", "^4.17.21", "<deleted>"],
       ]
     )
     const zod = withOurs.packageConflicts?.find(conflict => conflict.name === "zod")
@@ -210,7 +210,7 @@ describe("a dependency one branch removed and the other changed", () => {
     assert.deepEqual(withTheirs.packageJson, {
       name: "app",
       scripts: {build: "tsc", lint: "eslint --fix ."},
-      dependencies: {react: "^18.3.1", lodash: "^4.17.21"},
+      dependencies: {lodash: "^4.17.21", react: "^18.3.1"},
     })
   })
 
@@ -220,10 +220,10 @@ describe("a dependency one branch removed and the other changed", () => {
       j(OURS),
       j(THEIRS)
     )
-    assert.deepEqual(result.packageJson!.dependencies, {react: "^18.3.1", zod: "3.23.8", lodash: "^4.17.21"})
+    assert.deepEqual(result.packageJson!.dependencies, {lodash: "^4.17.21", react: "^18.3.1", zod: "3.23.8"})
     assert.deepEqual(
       result.packageConflicts?.filter(conflict => conflict.resolvedBy === "pick").map(conflict => conflict.name),
-      ["zod", "lodash"]
+      ["lodash", "zod"]
     )
   })
 
@@ -246,9 +246,9 @@ describe("a dependency one branch removed and the other changed", () => {
     assert.deepEqual(
       result.packageConflicts?.map(conflict => [conflict.name, conflict.resolvedBy]),
       [
+        ["lodash", "removal"],
         ["react", "highest"],
         ["zod", "removal"],
-        ["lodash", "removal"],
       ]
     )
   })
@@ -256,7 +256,7 @@ describe("a dependency one branch removed and the other changed", () => {
   test("without the ancestor, a missing dependency cannot be told from an added one, so both are kept", async () => {
     const result = await resolver().resolveConflicts(conflictedDocument(OURS, THEIRS))
     assert.equal(result.resolved, true, result.errors.join(", "))
-    assert.deepEqual(result.packageJson!.dependencies, {react: "^18.3.1", zod: "^3.23.0", lodash: "^4.17.21"})
+    assert.deepEqual(result.packageJson!.dependencies, {lodash: "^4.17.21", react: "^18.3.1", zod: "^3.23.0"})
   })
 })
 
@@ -781,8 +781,8 @@ describe("the CLI with a dependency one branch removed", () => {
         quiet.stderr.includes(
           [
             "⚠️  2 dependencies one branch removed stay removed in package.json, without the other branch's changes:",
-            "   - dependencies.zod: their branch removed it, our change to ^3.23.0 was dropped",
             "   - dependencies.lodash: our branch removed it, their change to ^4.17.21 was dropped",
+            "   - dependencies.zod: their branch removed it, our change to ^3.23.0 was dropped",
             "   Add back any that are still needed.",
           ].join("\n")
         ),
@@ -793,8 +793,8 @@ describe("the CLI with a dependency one branch removed", () => {
       const json = await runCli(["--json", "--no-regenerate-lock"], dir)
       const warning = jsonLines(json.stdout).find(record => record.data?.droppedChanges !== undefined)
       assert.deepEqual(warning.data.droppedChanges, [
-        {field: "dependencies.zod", package: "zod", removedBy: "theirs", change: "^3.23.0", base: "^3.22.0"},
         {field: "dependencies.lodash", package: "lodash", removedBy: "ours", change: "^4.17.21", base: "^4.17.20"},
+        {field: "dependencies.zod", package: "zod", removedBy: "theirs", change: "^3.23.0", base: "^3.22.0"},
       ])
     })
   })

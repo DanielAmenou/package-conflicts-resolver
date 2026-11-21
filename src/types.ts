@@ -28,6 +28,21 @@ export interface ConflictMarker {
   field?: string
 }
 
+/**
+ * The versions of a conflicted file that Git keeps in its index until the
+ * conflict is resolved: each branch's own, and their common ancestor's. A
+ * merge of these three knows which branch changed each value, which default
+ * conflict markers do not show.
+ */
+export interface MergeVersions {
+  /** The file on our branch (index stage 2) */
+  ours: string
+  /** The file on their branch (index stage 3) */
+  theirs: string
+  /** The file in the common ancestor (index stage 1): none when both branches added the file */
+  base?: string
+}
+
 export interface ResolutionStrategy {
   name: "highest" | "lowest" | "ours" | "theirs"
   description: string

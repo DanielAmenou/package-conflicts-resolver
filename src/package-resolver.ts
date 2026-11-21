@@ -11,9 +11,11 @@ import {Logger} from "./logger.js"
 import {parseJsonLenient} from "./json-repair.js"
 import {isNpmLockfile, validateLockfile} from "./lockfile-validator.js"
 import {lockedVersionSatisfies, normalizeVersionPicks} from "./version-picks.js"
+import {compareWithVersions} from "./merge-versions.js"
 import {
   PackageJson,
   ConflictMarker,
+  MergeVersions,
   ResolutionResult,
   ResolvedConflict,
   CliOptions,
@@ -225,12 +227,16 @@ function stringifyWithConflicts(document: PackageJson, indent: string, unresolve
       setAt(copy, conflict.path, standIn(index))
     }
   })
-  // Last to first, so that the one-sided properties keep their order at the front
-  for (let index = unresolved.length - 1; index >= 0; index--) {
-    const conflict = unresolved[index] as UnresolvedConflict
-    if (oneSided(conflict)) {
-      setAt(copy, conflict.path, standIn(index), {first: true})
-    }
+  // The one-sided properties come first in their object: the ones we still have, then the ones they do. That is the
+  // order a later run reads them back in (see mergedKeyOrder), so that it writes the same file again.
+  const indexes = unresolved.map((_, index) => index).filter(index => oneSided(unresolved[index] as UnresolvedConflict))
+  const front = [
+    ...indexes.filter(index => unresolved[index]?.ours !== undefined),
+    ...indexes.filter(index => unresolved[index]?.ours === undefined),
+  ]
+  // Last to first, since each one is put before the others
+  for (const index of front.reverse()) {
+    setAt(copy, (unresolved[index] as UnresolvedConflict).path, standIn(index), {first: true})
   }
 
   return JSON.stringify(copy, null, indent)
@@ -286,6 +292,95 @@ function setAt(document: Record<string, any>, path: string[], value: unknown, {f
   }
 }
 
+/**
+ * The orders package managers keep the keys of an object in: npm sorts
+ * dependencies and the entries of its lockfile with the "en" collation, other
+ * tools by character code.
+ */
+const KEY_ORDERS: ReadonlyArray<(a: string, b: string) => number> = [
+  new Intl.Collator("en").compare,
+  (a, b) => (a < b ? -1 : a > b ? 1 : 0),
+]
+
+/**
+ * The order of the keys of an object merged from two branches: ours, with
+ * each key only their branch has where it sits in their order, as
+ * mergeArrayValues does for lists.
+ *
+ * - When both branches keep their keys sorted, the merged keys are sorted the
+ *   same way: the order the package manager writes on the next install, so
+ *   that the merge does not show up later as an unrelated diff.
+ * - Otherwise our order is kept, and each key only they have follows the key
+ *   it comes after in their object, after the keys only we have there.
+ */
+function mergedKeyOrder(ours: string[], theirs: string[]): string[] {
+  const inOurs = new Set(ours)
+  const onlyTheirs = theirs.filter(key => !inOurs.has(key))
+  if (onlyTheirs.length === 0) {
+    return ours
+  }
+
+  const sorted = (keys: string[], compare: (a: string, b: string) => number) =>
+    keys.every((key, index) => index === 0 || compare(keys[index - 1] as string, key) <= 0)
+  for (const compare of KEY_ORDERS) {
+    if (sorted(ours, compare) && sorted(theirs, compare)) {
+      return mergeSorted(ours, onlyTheirs, compare)
+    }
+  }
+
+  // Their keys we do not have, by the index of our key they come after in their order (-1: before all of ours)
+  const position = new Map(ours.map((key, index) => [key, index]))
+  const after = new Map<number, string[]>()
+  let anchor = -1
+  for (const key of theirs) {
+    const index = position.get(key)
+    if (index !== undefined) {
+      anchor = Math.max(anchor, index)
+    } else if (after.has(anchor)) {
+      after.get(anchor)?.push(key)
+    } else {
+      after.set(anchor, [key])
+    }
+  }
+
+  // Each group goes right before our next key they have too: after the keys only we have at that place
+  const inTheirs = new Set(theirs)
+  const ordered: string[] = []
+  const waiting: string[][] = [after.get(-1) ?? []]
+  const placeWaiting = () => {
+    for (const group of waiting.splice(0)) {
+      for (const key of group) {
+        ordered.push(key)
+      }
+    }
+  }
+  ours.forEach((key, index) => {
+    if (inTheirs.has(key)) {
+      placeWaiting()
+    }
+    ordered.push(key)
+    const group = after.get(index)
+    if (group !== undefined) {
+      waiting.push(group)
+    }
+  })
+  placeWaiting()
+  return ordered
+}
+
+/** Two sorted lists without a common item, as one sorted list */
+function mergeSorted(first: string[], second: string[], compare: (a: string, b: string) => number): string[] {
+  const merged: string[] = []
+  let next = 0
+  for (const item of first) {
+    while (next < second.length && compare(second[next] as string, item) < 0) {
+      merged.push(second[next++] as string)
+    }
+    merged.push(item)
+  }
+  return merged.concat(second.slice(next))
+}
+
 export class PackageResolver {
   private logger: Logger
   private options: CliOptions
@@ -304,9 +399,17 @@ export class PackageResolver {
   }
 
   /**
-   * Resolve conflicts in package.json content
+   * Resolve conflicts in package.json content.
+   *
+   * With the `versions` of the file in Git's index, the merge is made from
+   * them rather than from the sides of the conflict markers, so that it knows
+   * the common ancestor of every value: a dependency one branch removed is
+   * not brought back by a conflict next to it. That only holds while the
+   * content is still what Git wrote: once it was edited, or resolved in part,
+   * the markers are what is left to resolve, and the versions are not used.
+   * Neither are versions that cannot be read as JSON objects.
    */
-  async resolveConflicts(content: string): Promise<ResolutionResult> {
+  async resolveConflicts(content: string, versions?: MergeVersions): Promise<ResolutionResult> {
     const result: ResolutionResult = {
       resolved: false,
       conflicts: [],
@@ -328,7 +431,9 @@ export class PackageResolver {
 
       this.logger.info("Found conflicts, resolving...")
 
-      const semanticResult = this.resolveConflictVariants(content)
+      const semanticResult =
+        (versions !== undefined ? this.resolveFromVersions(content, versions) : null) ??
+        this.resolveConflictVariants(content)
       if (semanticResult) {
         result.conflicts = semanticResult.conflicts
         result.packageJson = semanticResult.packageJson
@@ -401,6 +506,30 @@ export class PackageResolver {
       result.errors.push(errorMsg)
     }
 
+    return result
+  }
+
+  /**
+   * Merge the versions in Git's index, when the conflicted content still
+   * reads as Git's own merge of them (see compareWithVersions). Null
+   * otherwise, and when they cannot be compared: the conflict markers decide.
+   */
+  private resolveFromVersions(content: string, versions: MergeVersions): ResolutionResult | null {
+    const check = compareWithVersions(content, versions)
+    if (check !== "follows") {
+      this.logger.info(
+        check === "changed"
+          ? "The file was edited or resolved in part since the merge: resolving what is left between its conflict markers"
+          : "The file cannot be compared with its versions in Git's index: resolving from its conflict markers"
+      )
+      return null
+    }
+
+    const result = this.mergeJsonContentsInternal(versions.ours, versions.theirs, versions.base)
+    if (!result.resolved) {
+      return null
+    }
+    this.logger.info("Merging our version, theirs and their common ancestor from Git's index")
     return result
   }
 
@@ -1342,7 +1471,8 @@ export class PackageResolver {
     const conflicts: ResolvedConflict[] = []
     const packageConflicts: PackageConflict[] = []
     const unresolved: UnresolvedConflict[] = []
-    const keys = this.orderedUnion(Object.keys(ourValue), Object.keys(theirValue), Object.keys(baseValue || {}))
+    // A key neither branch has is gone, whatever the common ancestor had
+    const keys = mergedKeyOrder(Object.keys(ourValue), Object.keys(theirValue))
 
     for (const key of keys) {
       const mergedChild = this.mergeValue(path.concat(key), baseValue?.[key], ourValue[key], theirValue[key], context)
@@ -1796,22 +1926,6 @@ export class PackageResolver {
 
   private formatPath(path: string[]): string {
     return path.length === 0 ? "root" : path.join(".")
-  }
-
-  private orderedUnion(...lists: string[][]): string[] {
-    const seen = new Set<string>()
-    const ordered: string[] = []
-
-    for (const list of lists) {
-      for (const item of list) {
-        if (!seen.has(item)) {
-          seen.add(item)
-          ordered.push(item)
-        }
-      }
-    }
-
-    return ordered
   }
 
   private isPlainObject(value: any): value is Record<string, any> {

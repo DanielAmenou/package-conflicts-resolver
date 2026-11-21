@@ -360,12 +360,15 @@ describe("CLI Integration Tests", () => {
       const cliResult = await runCli(["--no-regenerate-lock", "package.json"], repoDir)
       assert.equal(cliResult.exitCode, 0)
 
+      // The conflict markers do not carry the common ancestor, but Git's index
+      // does: the result is the merge driver's (see the next test), with the
+      // feature branch's downgrade of lodash kept rather than undone by "highest"
       const resolvedPackage = JSON.parse(await readFile(join(repoDir, "package.json"), "utf8"))
       assert.deepEqual(resolvedPackage, {
         name: "demo",
         version: "2.0.0",
         dependencies: {
-          lodash: "^4.17.21",
+          lodash: "^4.17.20",
           express: "^4.18.0",
           react: "^18.0.0",
         },

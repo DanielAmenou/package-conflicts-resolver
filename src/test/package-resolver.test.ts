@@ -314,11 +314,8 @@ describe("PackageResolver", () => {
     const scriptsOrder = Object.keys(scripts)
 
     // Should preserve order from HEAD (our) branch for existing scripts
-    // and append new scripts from their branch at the end
-    assert.equal(scriptsOrder[0], "build", "build should be first")
-    assert.equal(scriptsOrder[1], "test", "test should be second")
-    assert.equal(scriptsOrder[2], "lint", "lint should be third")
-    assert.equal(scriptsOrder[3], "start", "start should be fourth")
+    // and put new scripts from their branch where they are in their order
+    assert.deepEqual(scriptsOrder, ["build", "test", "start", "lint"])
 
     // Verify the values are correct too
     assert.equal(scripts.build, "tsc", "build should be from ours")

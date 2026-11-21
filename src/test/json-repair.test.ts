@@ -589,7 +589,8 @@ describe("parseJsonLenient on large documents", () => {
     assert.equal(result.resolved, true, result.errors.join(", "))
     const names = Object.keys(result.packageJson!.packages)
     assert.equal(names.length, 8003)
-    assert.deepEqual(names.slice(-3), ["node_modules/zz-ours", "node_modules/zzz-after", "node_modules/zz-theirs"])
+    // Their entry is where it sits in their lockfile, not after all of ours
+    assert.deepEqual(names.slice(-3), ["node_modules/zz-ours", "node_modules/zz-theirs", "node_modules/zzz-after"])
     assert(elapsed < 5000, `${(text.length / 1e6).toFixed(1)} MB took ${Math.round(elapsed)} ms`)
   })
 })

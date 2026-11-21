@@ -5,17 +5,18 @@ A Node.js CLI tool that automatically resolves conflicts in `package.json` and `
 ## Features
 
 - **Automatic conflict resolution** with configurable strategies
-- **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`). Lists such as `files` and `keywords` merge item by item: what either branch added is kept, and what either branch removed stays removed. A dependency one branch removed stays removed too, even if the other branch upgraded it
+- **True 3-way merges** - a change made on only one branch is always kept; strategies only decide fields both branches changed (the same rule Git uses for `-X ours` / `-X theirs`). The command reads the common ancestor from Git itself, so this holds with any conflict style (see [Where the common ancestor comes from](#where-the-common-ancestor-comes-from)). Lists such as `files` and `keywords` merge item by item: what either branch added is kept, and what either branch removed stays removed. A dependency one branch removed stays removed too, even if the other branch upgraded it
 - **No guessing** - a value the strategy has no order for is left for you between conflict markers around just that property, while everything else is merged: a script both branches changed, a script one branch removed while the other changed it, or two specs that cannot be compared, such as a git URL and a range (see [Values left for you to decide](#values-left-for-you-to-decide))
 - **Smart version resolution** using semver: ranges and pre-releases are ordered correctly, and `npm:` aliases, `workspace:` ranges and git tags are compared by their versions, never by digits that happen to be in a URL, a file name or a commit hash
 - **List conflicted packages** - `--list` shows every package whose version conflicts, with our, their (and the base) version and what the resolution would keep, as a table or JSON (see [Listing conflicted packages](#listing-conflicted-packages))
 - **Pick versions per package** - `--pick lodash@4.17.21` resolves the packages you choose to the versions you choose, checked against the registry first, while the strategy resolves everything else (see [Choosing versions for specific packages](#choosing-versions-for-specific-packages))
 - **Git integration** as merge driver or in hooks
-- **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers (diff3 base sections enable true 3-way merges)
+- **All conflict styles** - supports `merge`, `diff3`, and `zdiff3` conflict markers
+- **Monorepos** - resolving the `package.json` of a workspace also resolves and regenerates the lockfile at the workspace root (see [Workspaces](#workspaces))
 - **Lockfile-safe merging** - a package-lock entry is resolved as a whole: `version`, `resolved`, and `integrity` are never mixed between branches
 - **Lockfile consistency check** - every merged `package-lock.json` is verified against its own dependency graph, so a lockfile `npm ci` would reject is never committed silently (see [Lockfile consistency](#lockfile-consistency))
 - **npm, yarn, pnpm, and bun aware** - npm lockfiles are merged directly; conflicted `yarn.lock` / `pnpm-lock.yaml` / `bun.lock` files are fixed by their own package manager without installing `node_modules` (see the table below), and the tool never creates a lockfile for a package manager your project doesn't use
-- **Stable JSON formatting** - preserves field order, indentation (tabs/spaces), and line endings (LF/CRLF)
+- **Stable JSON formatting** - preserves field order, indentation (tabs/spaces), and line endings (LF/CRLF). A dependency the other branch added goes where it belongs in the list, as your package manager would sort it, instead of at the end
 - **Cross-platform** - works on Linux, macOS, and Windows
 
 ## Installation
@@ -82,6 +83,18 @@ When the target is a `package.json`, conflicted sibling lockfiles are detected a
 
 Regeneration only runs for lockfiles that already exist in your project, never installs `node_modules`, and can be skipped with `--no-regenerate-lock`.
 
+#### Workspaces
+
+In a workspace (npm, yarn, pnpm or bun), the packages have no lockfile of their own: one lockfile at the root locks them all. When the target `package.json` has no lockfile next to it, the lockfile of its workspace root is used instead: its conflicts are resolved, and it is regenerated there.
+
+```bash
+# Resolves packages/web/package.json and the package-lock.json at the workspace root
+npx package-conflicts-resolver packages/web/package.json
+```
+
+- The root is the nearest folder above the package that has a lockfile, inside the same Git repository. It only counts when it lists the package among its workspaces (`workspaces` in its `package.json`, or `packages` in its `pnpm-workspace.yaml`). A lockfile that belongs to another project is never touched.
+- A package manager cannot read a `package.json` that still has conflict markers. While another package of the workspace is conflicted, the lockfile is merged but not regenerated yet, and the command says which files it is waiting for. Resolving the last one regenerates it.
+
 ### Resolution Strategies
 
 - `highest` (default) - Use the highest version
@@ -89,7 +102,27 @@ Regeneration only runs for lockfiles that already exist in your project, never i
 - `ours` - Use our version (current branch)
 - `theirs` - Use their version (incoming branch)
 
-Strategies only decide **real conflicts**: fields that both branches changed to different values. When the common ancestor is known (merge driver, or `diff3`/`zdiff3` conflict markers), a field changed on one branch only is taken from that branch regardless of the strategy — exactly like Git itself. With default-style conflict markers (no ancestor) every differing field is treated as a conflict.
+Strategies only decide **real conflicts**: fields that both branches changed to different values. A field changed on one branch only is taken from that branch regardless of the strategy — exactly like Git itself. That takes the common ancestor of the two branches, which the tool knows in almost every case (see below). Only without it is every differing field treated as a conflict.
+
+#### Where the common ancestor comes from
+
+- **Merge driver**: Git hands the driver the ancestor's version of the file.
+- **A file Git left conflicted**: Git's default conflict markers show our side and theirs, but not the ancestor. Git keeps all three versions of the file in its index until the conflict is resolved, so the command reads them from there. The result is the merge driver's, with any conflict style:
+
+  ```
+  <<<<<<< HEAD
+      "lodash": "^4.17.22",
+  =======
+      "express": "^4.18.0",
+      "left-pad": "^1.3.0",
+      "lodash": "^4.17.21",
+  >>>>>>> feature
+  ```
+
+  From the markers alone, `left-pad` could have been added by their branch or removed by ours. The index tells that our branch removed it: it stays removed, `express` is added, and `lodash` is the only conflict.
+
+- **A file you changed after the merge**: once a conflict was resolved by hand, a value was edited, or an earlier run decided some values and left others for you, the versions in the index no longer describe the file. The command notices, and resolves what is still between conflict markers, leaving everything else as it is. `diff3`/`zdiff3` markers carry the ancestor themselves; with default markers every difference between the two sides is then a conflict.
+- **Outside a Git repository**, or for a file Git does not list as conflicted, only the markers are there to go by, in the same way.
 
 Lists of plain values, such as `files`, `keywords`, `os` or `workspaces`, merge item by item against the common ancestor: an item either branch added is kept, and an item either branch removed stays removed. Without the ancestor, the two lists are combined. Lists of objects are decided as a whole.
 
@@ -178,12 +211,12 @@ Choose the version of a package with --pick <name>@<version>, for example --pick
 ```
 
 - **Where** is the dependency field of a declared range (`dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`; in a lockfile, `root › dependencies` is the project's own entry and `packages/web › dependencies` a workspace's), or the install location of a locked version (`node_modules/lodash`, `node_modules/debug/node_modules/ms`).
-- A **Base** column shows the common ancestor's version when the conflict markers carry it (`diff3`/`zdiff3` conflict style). Then a package only one branch changed is no conflict: it merges to that branch's version and is not listed.
+- A **Base** column shows the common ancestor's version when it is known (see [Where the common ancestor comes from](#where-the-common-ancestor-comes-from)). Then a package only one branch changed is no conflict: it merges to that branch's version and is not listed.
 - **Resolved** follows `--strategy`, and previews `--pick` (marked `(picked)`). A package the strategy cannot decide reads `(left for you)` (see [Values left for you to decide](#values-left-for-you-to-decide)), and a version a branch removed reads `(removed)`.
 - **Left for you to decide** lists the other values a run leaves between conflict markers, such as scripts.
 - With `--json`, the report is printed as a single JSON document: `{"strategy", "files": [{"file", "analyzed", "packages": [{"name", "kind", "location", "path", "ours", "theirs", "base"?, "resolved", "resolvedBy", "pick"?}], "otherConflicts": [{"field", "ours", "theirs", "resolved"}], "unresolved": [{"field", "path", "reason", "ours", "theirs", "base"?}]}]}`. `kind` is `"spec"` for a declared range and `"lock"` for a locked version. `ours` and `theirs` are `null` for a branch that removed the value, and `resolved` is `null` when the resolution removes the value or leaves it for you. `resolvedBy` is then `"removal"` for a dependency that stays removed, and `"user"` for a value left for you. `unresolved` lists every value left for you, packages included, with a `reason` of `"not-a-version"`, `"not-comparable"` or `"removed"`.
 
-Like a normal run, `--list` looks at the conflicted lockfiles next to a package.json. Conflicted `yarn.lock`, `pnpm-lock.yaml` and `bun.lock` files are mentioned but not analyzed, since their package manager resolves them. The command exits with code 1 only when a conflicted npm file cannot be analyzed, or when a `--pick` is invalid.
+Like a normal run, `--list` looks at the conflicted lockfiles next to a package.json, or at the root of its [workspace](#workspaces). Conflicted `yarn.lock`, `pnpm-lock.yaml` and `bun.lock` files are mentioned but not analyzed, since their package manager resolves them. The command exits with code 1 only when a conflicted npm file cannot be analyzed, or when a `--pick` is invalid.
 
 ### Choosing versions for specific packages
 
@@ -229,6 +262,8 @@ After every `package-lock.json` / `npm-shrinkwrap.json` merge the tool therefore
   git add package-lock.json
   git commit
   ```
+
+  Running `npx package-conflicts-resolver` does the first step for you: a merged lockfile that Git still lists as conflicted is regenerated, although it has no conflict markers. With `--no-regenerate-lock` it is checked instead.
 
   To accept such merges anyway, add `--allow-inconsistent-lockfile` to the merge driver command:
 
@@ -415,6 +450,9 @@ const resolver = new PackageResolver({
   regenerateLock: true,
 })
 
+// In a Git repository, the versions of the file in Git's index can be given as a second
+// argument, {ours, theirs, base?} (`git show :2:package.json`, `:3:` and `:1:`): they are merged
+// instead of the sides of the conflict markers, while the content is still Git's merge of them
 const result = await resolver.resolveConflicts(conflictedContent)
 if (result.resolved && result.packageJson) {
   // Formatted like the original; values left for you are written between conflict markers
@@ -531,6 +569,15 @@ package-conflicts-resolver verify
 
 - This means your file doesn't have conflicts, or they've already been resolved.
 - Run `package-conflicts-resolver verify` to check your setup.
+- When the message adds that Git still lists the file as conflicted, the file was resolved without being staged, or a merge driver failed and left one branch's version in place. Check that the file has the changes of both branches, then `git add` it.
+
+**"The file was edited or resolved in part since the merge"**
+
+- The file is no longer what Git's merge left: a conflict was resolved by hand, a value was edited, or an earlier run (or the merge driver) left values for you to decide. What was decided is kept, and only what is still between conflict markers is resolved. See [Where the common ancestor comes from](#where-the-common-ancestor-comes-from).
+
+**"Lockfiles were not regenerated: ... still has conflicts"**
+
+- Another `package.json` of the same workspace has conflict markers, which no package manager can read. Resolve it too: the lockfile is regenerated with the last one. See [Workspaces](#workspaces).
 
 **"Git merge driver is NOT configured"**
 
@@ -538,7 +585,7 @@ package-conflicts-resolver verify
 
 **"merged lockfile is not consistent" during `git merge`**
 
-- The two branches' lockfiles cannot be combined into a graph that satisfies every dependency (the message lists the ones that fail). Run `npm install --package-lock-only`, then `git add package-lock.json` and finish the merge. See [Lockfile consistency](#lockfile-consistency).
+- The two branches' lockfiles cannot be combined into a graph that satisfies every dependency (the message lists the ones that fail). Run `npm install --package-lock-only` (or `package-conflicts-resolver`, which runs it), then `git add package-lock.json` and finish the merge. See [Lockfile consistency](#lockfile-consistency).
 
 **"left ... between conflict markers for you to decide" during `git merge`**
 
