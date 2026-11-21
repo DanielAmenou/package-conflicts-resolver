@@ -455,7 +455,9 @@ describe("a lockfile whose lines Git's merge stitched together", () => {
       const file = join(dir, "package-lock.json")
       const merged = await stitchedMerge(dir)
       assert.equal(await isGitMergeOutput(file, merged), true)
-      assert.equal(await isGitMergeOutput(file, merged.replace(/\n/g, "\r\n")), true)
+      // Git may have checked the file out with either (Windows: CRLF), so convert from whichever it has
+      assert.equal(await isGitMergeOutput(file, merged.replace(/\r?\n/g, "\r\n")), true)
+      assert.equal(await isGitMergeOutput(file, merged.replace(/\r\n/g, "\n")), true)
       assert.equal(await isGitMergeOutput(file, merged.replace('"license": "MIT"', '"license": "ISC"')), false)
 
       for (const style of ["diff3", "zdiff3"]) {
